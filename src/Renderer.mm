@@ -84,6 +84,47 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
     return m;
 }
 
+static NSUInteger bytes_per_pixel(MTLPixelFormat format)
+{
+    switch (format)
+    {
+        case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatDepth32Float:
+            return 4;
+        case MTLPixelFormatRGBA16Float:
+            return 8;
+        default:
+            return 0;
+    }
+}
+
+static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
+{
+    if (!texture)
+    {
+        return 0;
+    }
+
+    NSUInteger bpp = bytes_per_pixel(texture.pixelFormat);
+    if (bpp == 0)
+    {
+        return 0;
+    }
+
+    uint64_t total = 0;
+    NSUInteger sampleCount = MAX((NSUInteger)1, texture.sampleCount);
+    NSUInteger levelCount = MAX((NSUInteger)1, texture.mipmapLevelCount);
+    for (NSUInteger level = 0; level < levelCount; ++level)
+    {
+        uint64_t w = MAX((uint64_t)1, (uint64_t)texture.width >> level);
+        uint64_t h = MAX((uint64_t)1, (uint64_t)texture.height >> level);
+        total += w * h * (uint64_t)bpp * (uint64_t)sampleCount;
+    }
+
+    return total;
+}
+
 @interface Renderer ()
 {
     CAMetalLayer *_metalLayer;
@@ -137,7 +178,24 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
     MetalDemoTopic _demoTopic;
     BOOL _historyValid;
     BOOL _supportsRayTracing;
+
+    BOOL _errorExampleEnabled;
+    float _userTimeScaleGain;
+    float _userEdgeGain;
+    float _userExposureGain;
+
+    double _lastCPUFrameTimeMs;
+    double _lastGPUFrameTimeMs;
+    double _lastEstimatedMemoryMB;
+    float _lastTimeScale;
+    float _lastEdgeStrength;
+    float _lastExposure;
+    float _lastBloomStrength;
+    float _lastParticleStrength;
+    float _lastTemporalBlend;
 }
+
+- (uint64_t)estimatedVideoMemoryBytes;
 @end
 
 @implementation Renderer
@@ -176,6 +234,81 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
 - (MetalDemoTopic)demoTopic
 {
     return _demoTopic;
+}
+
+- (void)setErrorExampleEnabled:(BOOL)enabled
+{
+    _errorExampleEnabled = enabled;
+}
+
+- (BOOL)errorExampleEnabled
+{
+    return _errorExampleEnabled;
+}
+
+- (void)setUserParameterTimeScale:(float)timeScale edgeGain:(float)edgeGain exposureGain:(float)exposureGain
+{
+    _userTimeScaleGain = fmaxf(0.25f, fminf(timeScale, 3.0f));
+    _userEdgeGain = fmaxf(0.1f, fminf(edgeGain, 3.0f));
+    _userExposureGain = fmaxf(0.25f, fminf(exposureGain, 3.0f));
+}
+
+- (MetalDemoRuntimeStats)runtimeStats
+{
+    MetalDemoRuntimeStats stats;
+    @synchronized (self)
+    {
+        stats.cpuFrameTimeMs = _lastCPUFrameTimeMs;
+        stats.gpuFrameTimeMs = _lastGPUFrameTimeMs;
+        stats.estimatedMemoryMB = _lastEstimatedMemoryMB;
+        stats.timeScale = _lastTimeScale;
+        stats.edgeStrength = _lastEdgeStrength;
+        stats.exposure = _lastExposure;
+        stats.bloomStrength = _lastBloomStrength;
+        stats.particleStrength = _lastParticleStrength;
+        stats.temporalBlend = _lastTemporalBlend;
+        stats.errorExampleEnabled = _errorExampleEnabled;
+    }
+    return stats;
+}
+
+- (NSString *)errorExampleSummary
+{
+    switch (_demoTopic)
+    {
+        case MetalDemoTopicResourceMemory:
+            return @"每帧强制重建渲染目标，模拟资源抖动导致的卡顿。";
+        case MetalDemoTopicArgumentBuffer:
+            return @"故意放大后期混合参数，观察绑定/合成配置错误导致的画面过曝。";
+        case MetalDemoTopicFunctionConstants:
+            return @"缩短变体切换周期，观察频繁路径切换导致的视觉不稳定。";
+        case MetalDemoTopicIndirectCommandBuffer:
+            return @"增加额外边缘计算轮次，模拟间接命令组织不当造成的 GPU 压力。";
+        case MetalDemoTopicParallelEncoding:
+            return @"提升时间缩放与计算负载，观察 CPU 编码与 GPU 并发失衡。";
+        case MetalDemoTopicDeferredLike:
+            return @"边缘权重过高，演示 deferred 合成参数失衡带来的伪影。";
+        case MetalDemoTopicShadowing:
+            return @"阴影混合过重，展示可见性计算错误对暗部层次的破坏。";
+        case MetalDemoTopicPBR:
+            return @"曝光和高光增强过量，展示 BRDF 参数超界导致的能量不守恒。";
+        case MetalDemoTopicHDRBloomTAA:
+            return @"高 bloom + 高 temporal，演示拖影和过亮 bloom 的典型错误。";
+        case MetalDemoTopicComputeParticles:
+            return @"提升粒子强度并增加计算轮次，观察填充率与合成瓶颈。";
+        case MetalDemoTopicTextureAdvanced:
+            return @"纹理边缘权重拉高，演示采样过滤配置不合理造成的锯齿。";
+        case MetalDemoTopicSyncAndScheduling:
+            return @"增加 GPU 压力，观察调度节奏不匹配时的帧时抖动。";
+        case MetalDemoTopicRayTracing:
+            return @"在回退路径上叠加负载，演示能力探测与降级策略不足的问题。";
+        case MetalDemoTopicMetalFXLike:
+            return @"提升 temporal 与曝光，演示上采样链路中的鬼影和光晕。";
+        case MetalDemoTopicProfiling:
+            return @"增加冗余 compute 轮次，便于在 capture 中观察热点阶段。";
+    }
+
+    return @"错误示例未定义。";
 }
 
 - (NSString *)demoTopicTitle
@@ -397,6 +530,34 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
     _historyValid = NO;
 }
 
+- (uint64_t)estimatedVideoMemoryBytes
+{
+    uint64_t total = 0;
+    total += estimated_texture_bytes(_sceneMSAATexture);
+    total += estimated_texture_bytes(_sceneResolveTexture);
+    total += estimated_texture_bytes(_sceneDepthTexture);
+    total += estimated_texture_bytes(_edgeTexture);
+    total += estimated_texture_bytes(_postMSAATexture);
+    total += estimated_texture_bytes(_bloomTextureA);
+    total += estimated_texture_bytes(_bloomTextureB);
+    total += estimated_texture_bytes(_particleTexture);
+    total += estimated_texture_bytes(_historyTexture);
+    total += estimated_texture_bytes(_halfResTexture);
+    total += estimated_texture_bytes(_upscaledTexture);
+    total += estimated_texture_bytes(_albedoTexture);
+    total += estimated_texture_bytes(_normalTexture);
+
+    total += _vertexBuffer ? _vertexBuffer.length : 0;
+    total += _indexBuffer ? _indexBuffer.length : 0;
+    total += _materialArgumentBuffer ? _materialArgumentBuffer.length : 0;
+    for (NSUInteger i = 0; i < kMaxFramesInFlight; ++i)
+    {
+        total += _uniformBuffers[i] ? _uniformBuffers[i].length : 0;
+    }
+
+    return total;
+}
+
 - (instancetype)initWithLayer:(CAMetalLayer *)layer
 {
     self = [super init];
@@ -420,6 +581,19 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
         _frameIndex = 0;
         _startTime = CFAbsoluteTimeGetCurrent();
         _demoTopic = MetalDemoTopicResourceMemory;
+        _errorExampleEnabled = NO;
+        _userTimeScaleGain = 1.0f;
+        _userEdgeGain = 1.0f;
+        _userExposureGain = 1.0f;
+        _lastCPUFrameTimeMs = 0.0;
+        _lastGPUFrameTimeMs = -1.0;
+        _lastEstimatedMemoryMB = 0.0;
+        _lastTimeScale = 1.0f;
+        _lastEdgeStrength = 0.9f;
+        _lastExposure = 1.0f;
+        _lastBloomStrength = 0.0f;
+        _lastParticleStrength = 0.0f;
+        _lastTemporalBlend = 0.0f;
 
         _commandQueue = [_device newCommandQueue];
         if (!_commandQueue)
@@ -731,7 +905,13 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
 {
     @autoreleasepool
     {
+        CFAbsoluteTime cpuFrameStart = CFAbsoluteTimeGetCurrent();
         dispatch_semaphore_wait(_inFlightSemaphore, DISPATCH_TIME_FOREVER);
+
+        if (_errorExampleEnabled && _demoTopic == MetalDemoTopicResourceMemory)
+        {
+            _sceneResolveTexture = nil;
+        }
 
         id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
         if (!drawable)
@@ -756,6 +936,15 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
 
         __block dispatch_semaphore_t semaphore = _inFlightSemaphore;
         [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull buffer) {
+            double gpuFrameMs = -1.0;
+            if (buffer.GPUEndTime > buffer.GPUStartTime)
+            {
+                gpuFrameMs = (buffer.GPUEndTime - buffer.GPUStartTime) * 1000.0;
+            }
+            @synchronized (self)
+            {
+                _lastGPUFrameTimeMs = gpuFrameMs;
+            }
             dispatch_semaphore_signal(semaphore);
         }];
 
@@ -788,6 +977,7 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
         BOOL useRayTraceMode = (_demoTopic == MetalDemoTopicRayTracing);
         BOOL useUpscale = (_demoTopic == MetalDemoTopicMetalFXLike);
         BOOL useProfiling = (_demoTopic == MetalDemoTopicProfiling);
+        uint32_t extraStressPasses = 0;
 
         if (_demoTopic == MetalDemoTopicFunctionConstants)
         {
@@ -858,6 +1048,70 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
                 sceneMix = 0.96f;
                 break;
         }
+
+        if (_errorExampleEnabled)
+        {
+            switch (_demoTopic)
+            {
+                case MetalDemoTopicResourceMemory:
+                    extraStressPasses = 1;
+                    break;
+                case MetalDemoTopicArgumentBuffer:
+                    sceneMix = 1.25f;
+                    edgeStrength = 1.8f;
+                    break;
+                case MetalDemoTopicFunctionConstants:
+                    timeScale = 2.2f;
+                    break;
+                case MetalDemoTopicIndirectCommandBuffer:
+                    extraStressPasses = 2;
+                    break;
+                case MetalDemoTopicParallelEncoding:
+                    timeScale = 2.4f;
+                    extraStressPasses = 2;
+                    break;
+                case MetalDemoTopicDeferredLike:
+                    edgeStrength = 2.2f;
+                    sceneMix = 0.75f;
+                    break;
+                case MetalDemoTopicShadowing:
+                    sceneMix = 0.72f;
+                    edgeStrength = 1.5f;
+                    break;
+                case MetalDemoTopicPBR:
+                    exposureBias = 2.1f;
+                    break;
+                case MetalDemoTopicHDRBloomTAA:
+                    bloomStrength = 0.7f;
+                    temporalBlend = _historyValid ? 0.92f : 0.0f;
+                    break;
+                case MetalDemoTopicComputeParticles:
+                    particleStrength = 1.2f;
+                    extraStressPasses = 2;
+                    break;
+                case MetalDemoTopicTextureAdvanced:
+                    edgeStrength = 1.4f;
+                    break;
+                case MetalDemoTopicSyncAndScheduling:
+                    extraStressPasses = 3;
+                    break;
+                case MetalDemoTopicRayTracing:
+                    exposureBias = _supportsRayTracing ? 1.9f : 1.2f;
+                    edgeStrength = _supportsRayTracing ? 0.5f : 1.7f;
+                    break;
+                case MetalDemoTopicMetalFXLike:
+                    temporalBlend = _historyValid ? 0.95f : 0.0f;
+                    exposureBias = 1.75f;
+                    break;
+                case MetalDemoTopicProfiling:
+                    extraStressPasses = 4;
+                    break;
+            }
+        }
+
+        timeScale = fmaxf(0.1f, timeScale * _userTimeScaleGain);
+        edgeStrength = fmaxf(0.0f, edgeStrength * _userEdgeGain);
+        exposureBias = fmaxf(0.1f, exposureBias * _userExposureGain);
 
         elapsed *= timeScale;
         Uniforms *uniforms = (Uniforms *)_uniformBuffers[uniformIndex].contents;
@@ -1053,6 +1307,10 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
         }
         MTLSize tgSize = MTLSizeMake(tgWidth, tgHeight, 1);
         [computeEncoder dispatchThreads:grid threadsPerThreadgroup:tgSize];
+        for (uint32_t i = 0; i < extraStressPasses; ++i)
+        {
+            [computeEncoder dispatchThreads:grid threadsPerThreadgroup:tgSize];
+        }
         [computeEncoder endEncoding];
 
         auto dispatch2D = ^(id<MTLComputeCommandEncoder> encoder,
@@ -1091,6 +1349,17 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
             [blurVEncoder setBytes:&horizontal length:sizeof(uint32_t) atIndex:0];
             dispatch2D(blurVEncoder, _blurPipelineState, _bloomTextureA.width, _bloomTextureA.height);
             [blurVEncoder endEncoding];
+
+            if (_errorExampleEnabled && _demoTopic == MetalDemoTopicHDRBloomTAA)
+            {
+                id<MTLComputeCommandEncoder> extraBlur = [commandBuffer computeCommandEncoder];
+                horizontal = 1;
+                [extraBlur setTexture:_bloomTextureA atIndex:0];
+                [extraBlur setTexture:_bloomTextureB atIndex:1];
+                [extraBlur setBytes:&horizontal length:sizeof(uint32_t) atIndex:0];
+                dispatch2D(extraBlur, _blurPipelineState, _bloomTextureB.width, _bloomTextureB.height);
+                [extraBlur endEncoding];
+            }
         }
 
         if (useParticles)
@@ -1184,6 +1453,20 @@ static matrix_float4x4 matrix_perspective(float fovYRadians, float aspect, float
         {
             [commandBuffer pushDebugGroup:@"FrameCommit"]; 
             [commandBuffer popDebugGroup];
+        }
+
+        double cpuFrameMs = (CFAbsoluteTimeGetCurrent() - cpuFrameStart) * 1000.0;
+        double memoryMB = (double)[self estimatedVideoMemoryBytes] / (1024.0 * 1024.0);
+        @synchronized (self)
+        {
+            _lastCPUFrameTimeMs = cpuFrameMs;
+            _lastEstimatedMemoryMB = memoryMB;
+            _lastTimeScale = timeScale;
+            _lastEdgeStrength = edgeStrength;
+            _lastExposure = exposureBias;
+            _lastBloomStrength = bloomStrength;
+            _lastParticleStrength = particleStrength;
+            _lastTemporalBlend = temporalBlend;
         }
 
         [commandBuffer presentDrawable:drawable];

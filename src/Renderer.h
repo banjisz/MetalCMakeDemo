@@ -23,6 +23,20 @@ typedef NS_ENUM(NSInteger, MetalDemoTopic)
 	MetalDemoTopicProfiling = 15
 };
 
+typedef struct
+{
+	double cpuFrameTimeMs;
+	double gpuFrameTimeMs;
+	double estimatedMemoryMB;
+	float timeScale;
+	float edgeStrength;
+	float exposure;
+	float bloomStrength;
+	float particleStrength;
+	float temporalBlend;
+	BOOL errorExampleEnabled;
+} MetalDemoRuntimeStats;
+
 @interface Renderer : NSObject
 
 - (instancetype)initWithLayer:(CAMetalLayer *)layer;
@@ -31,6 +45,11 @@ typedef NS_ENUM(NSInteger, MetalDemoTopic)
 - (void)setDemoTopic:(MetalDemoTopic)topic;
 - (MetalDemoTopic)demoTopic;
 - (NSString *)demoTopicTitle;
+- (void)setErrorExampleEnabled:(BOOL)enabled;
+- (BOOL)errorExampleEnabled;
+- (void)setUserParameterTimeScale:(float)timeScale edgeGain:(float)edgeGain exposureGain:(float)exposureGain;
+- (MetalDemoRuntimeStats)runtimeStats;
+- (NSString *)errorExampleSummary;
 
 + (NSArray<NSString *> *)allDemoTopicTitles;
 
