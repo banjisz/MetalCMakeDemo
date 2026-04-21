@@ -15,6 +15,7 @@ struct Vertex
 
 struct Uniforms
 {
+    float4x4 viewProjectionMatrix;
     float4x4 modelViewProjectionMatrix;
     float4x4 modelMatrix;
     float3 lightDirection;
@@ -23,6 +24,13 @@ struct Uniforms
     float bloomStrength;
     uint demoTopic;
     uint featureFlags;
+};
+
+struct InstanceData
+{
+    float4x4 modelMatrix;
+    float3 tint;
+    float pad;
 };
 
 struct MaterialArguments
@@ -57,18 +65,35 @@ struct PostVertexOut
     float2 uv;
 };
 
+static inline float3 fresnel_schlick(float cosTheta, float3 F0);
+static inline float3 fresnel_schlick_roughness(float cosTheta, float3 F0, float roughness);
+
 vertex SceneVertexOut scene_vertex(const device Vertex *vertices [[buffer(0)]],
                                    constant Uniforms &uniforms [[buffer(1)]],
-                                   uint vertexID [[vertex_id]])
+                                   const device InstanceData *instances [[buffer(2)]],
+                                   uint vertexID [[vertex_id]],
+                                   uint instanceID [[instance_id]])
 {
     Vertex v = vertices[vertexID];
     float4 modelPos = float4(v.position, 1.0);
 
     SceneVertexOut out;
-    out.position = uniforms.modelViewProjectionMatrix * modelPos;
-    out.worldPosition = (uniforms.modelMatrix * modelPos).xyz;
-    out.worldNormal = normalize((uniforms.modelMatrix * float4(v.normal, 0.0)).xyz);
-    out.color = v.color;
+    if (uniforms.demoTopic == 4u)
+    {
+        InstanceData instance = instances[instanceID];
+        float4 worldPos = instance.modelMatrix * modelPos;
+        out.position = uniforms.viewProjectionMatrix * worldPos;
+        out.worldPosition = worldPos.xyz;
+        out.worldNormal = normalize((instance.modelMatrix * float4(v.normal, 0.0)).xyz);
+        out.color = v.color * instance.tint;
+    }
+    else
+    {
+        out.position = uniforms.modelViewProjectionMatrix * modelPos;
+        out.worldPosition = (uniforms.modelMatrix * modelPos).xyz;
+        out.worldNormal = normalize((uniforms.modelMatrix * float4(v.normal, 0.0)).xyz);
+        out.color = v.color;
+    }
     out.uv = v.uv;
     return out;
 }
@@ -111,31 +136,39 @@ fragment float4 scene_fragment(SceneVertexOut in [[stage_in]],
 
     if (kUsePBR)
     {
-        float roughness = 0.35;
-        float metallic = 0.2;
+        float roughness = clamp(0.35, 0.045, 1.0);
+        float metallic  = clamp(0.20, 0.0,   1.0);
+        float ao        = 1.0;
         float3 F0 = mix(float3(0.04), baseColor, metallic);
-        float NdotV = saturate(dot(Nmap, V));
-        float NdotH = saturate(dot(Nmap, H));
-        float VdotH = saturate(dot(V, H));
 
-        float alpha = roughness * roughness;
-        float alpha2 = alpha * alpha;
-        float denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
-        float D = alpha2 / max(M_PI_F * denom * denom, 1e-4);
+        float NdotV = max(dot(Nmap, V), 0.0);
+        float NdotL = max(dot(Nmap, L), 0.0);
+        float NdotH = max(dot(Nmap, H), 0.0);
+        float VdotH = max(dot(V, H), 0.0);
 
-        float k = (roughness + 1.0);
-        k = (k * k) * 0.125;
-        float Gv = NdotV / (NdotV * (1.0 - k) + k);
-        float Gl = NdotL / (NdotL * (1.0 - k) + k);
+        float a  = roughness * roughness;
+        float a2 = a * a;
+        float dDenom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+        float D = a2 / max(M_PI_F * dDenom * dDenom, 1e-5);
+
+        float k = ((roughness + 1.0) * (roughness + 1.0)) * 0.125;
+        float Gv = NdotV / max(NdotV * (1.0 - k) + k, 1e-5);
+        float Gl = NdotL / max(NdotL * (1.0 - k) + k, 1e-5);
         float G = Gv * Gl;
 
-        float3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-        float3 specBRDF = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
-        float3 kd = (1.0 - F) * (1.0 - metallic);
-        float3 diffuse = kd * baseColor / M_PI_F;
+        float3 F = fresnel_schlick(VdotH, F0);
+        float3 specBRDF = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-5);
+        float3 kS = F;
+        float3 kD = (1.0 - kS) * (1.0 - metallic);
+        float3 diffuse = kD * baseColor / M_PI_F;
 
-        float3 lit = (diffuse + specBRDF) * NdotL;
-        float3 ambient = baseColor * 0.12;
+        float3 radiance = float3(1.0);
+        float3 lit = (diffuse + specBRDF) * radiance * NdotL;
+
+        float3 F_amb = fresnel_schlick_roughness(NdotV, F0, roughness);
+        float3 kS_amb = F_amb;
+        float3 kD_amb = (1.0 - kS_amb) * (1.0 - metallic);
+        float3 ambient = (kD_amb * baseColor * 0.12) * ao;
 
         float shadow = 1.0;
         if (kUseShadow)
@@ -159,6 +192,25 @@ fragment float4 scene_fragment(SceneVertexOut in [[stage_in]],
     }
 
     return float4((ambient + diffuse + spec) * shadow, 1.0);
+}
+
+// ICB-compatible variant: no fragment buffers/textures/samplers.
+// This is deliberately conservative because many devices/drivers reject
+// more complex fragment signatures on ICB-enabled render pipelines.
+fragment float4 scene_fragment_icb(SceneVertexOut in [[stage_in]])
+{
+    float3 lightDir = normalize(float3(0.5, 0.8, 0.4));
+    float3 baseColor = in.color;
+    float3 Ngeo = normalize(in.worldNormal);
+    float NdotL = saturate(dot(Ngeo, lightDir));
+    float3 V = normalize(float3(0.0, 0.0, 5.0) - in.worldPosition);
+    float3 H = normalize(lightDir + V);
+    float specular = pow(saturate(dot(Ngeo, H)), 48.0);
+
+    float3 ambient = baseColor * 0.20;
+    float3 diffuse = baseColor * (0.20 + 0.80 * NdotL);
+    float3 spec = float3(0.45) * specular;
+    return float4(ambient + diffuse + spec, 1.0);
 }
 
 vertex PostVertexOut post_vertex(uint vertexID [[vertex_id]])
@@ -210,6 +262,16 @@ static inline float luma(float3 c)
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
+static inline float3 fresnel_schlick(float cosTheta, float3 F0)
+{
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+static inline float3 fresnel_schlick_roughness(float cosTheta, float3 F0, float roughness)
+{
+    return F0 + (max(float3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
 kernel void edge_detect_kernel(texture2d<float, access::read> sourceTexture [[texture(0)]],
                                texture2d<float, access::write> edgeTexture [[texture(1)]],
                                uint2 gid [[thread_position_in_grid]])
@@ -248,20 +310,28 @@ kernel void edge_detect_kernel(texture2d<float, access::read> sourceTexture [[te
     edgeTexture.write(float4(edge, edge, edge, 1.0), gid);
 }
 
+// bright_extract_kernel writes to a HALF-resolution bloom texture.
+// A 2x2 box sample from the full-res source gives a free downsample step,
+// matching the allocation in ensureRenderTargetsForDrawable.
 kernel void bright_extract_kernel(texture2d<float, access::read> sourceTexture [[texture(0)]],
                                   texture2d<float, access::write> brightTexture [[texture(1)]],
                                   constant float &threshold [[buffer(0)]],
                                   uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= sourceTexture.get_width() || gid.y >= sourceTexture.get_height())
+    if (gid.x >= brightTexture.get_width() || gid.y >= brightTexture.get_height())
     {
         return;
     }
 
-    float3 c = sourceTexture.read(gid).rgb;
+    // Map half-res gid -> full-res 2x2 block for box-filter downsample.
+    uint2 base = gid * 2;
+    uint2 maxC = uint2(sourceTexture.get_width() - 1, sourceTexture.get_height() - 1);
+    float3 c = (sourceTexture.read(min(base,                   maxC)).rgb +
+                sourceTexture.read(min(base + uint2(1, 0),     maxC)).rgb +
+                sourceTexture.read(min(base + uint2(0, 1),     maxC)).rgb +
+                sourceTexture.read(min(base + uint2(1, 1),     maxC)).rgb) * 0.25;
     float l = luma(c);
-    float3 out = l > threshold ? c : float3(0.0);
-    brightTexture.write(float4(out, 1.0), gid);
+    brightTexture.write(float4(l > threshold ? c : float3(0.0), 1.0), gid);
 }
 
 kernel void blur_kernel(texture2d<float, access::read> sourceTexture [[texture(0)]],

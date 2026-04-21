@@ -1,33 +1,8 @@
 #import "AppDelegate.h"
 #import "Renderer.h"
 #import <QuartzCore/CAMetalLayer.h>
-#import <CoreVideo/CoreVideo.h>
-
-static CVReturn DisplayLinkOutputCallback(CVDisplayLinkRef displayLink,
-                                          const CVTimeStamp *now,
-                                          const CVTimeStamp *outputTime,
-                                          CVOptionFlags flagsIn,
-                                          CVOptionFlags *flagsOut,
-                                          void *displayLinkContext)
-{
-    (void)displayLink;
-    (void)now;
-    (void)outputTime;
-    (void)flagsIn;
-    (void)flagsOut;
-
-    AppDelegate *delegate = (__bridge AppDelegate *)displayLinkContext;
-    if (!delegate)
-    {
-        return kCVReturnError;
-    }
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [delegate drawFrame];
-    });
-
-    return kCVReturnSuccess;
-}
+#import <QuartzCore/CADisplayLink.h>   // macOS 14+: replaces CVDisplayLink
+// CADisplayLink fires directly on the main run loop — no dispatch_async needed.
 
 static NSString *TopicDocumentation(MetalDemoTopic topic)
 {
@@ -125,7 +100,7 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     NSWindow *_window;
     MetalView *_metalView;
     Renderer *_renderer;
-    CVDisplayLinkRef _displayLink;
+    CADisplayLink *_displayLink;     // macOS 14+ replacement for CVDisplayLink
     NSMutableString *_topicInputBuffer;
     NSTimer *_topicInputTimer;
 
@@ -146,10 +121,16 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
 
     NSMenuItem *_errorMenuItem;
     NSMenuItem *_docMenuItem;
+
+    // Perf: cache last drawable size to skip redundant CALayer property writes.
+    CGSize _lastDrawableSize;
+    // Perf: throttle HUD NSTextField updates to ~5fps instead of 60fps.
+    NSUInteger _hudRefreshCounter;
 }
 
 - (BOOL)startDisplayLink;
 - (void)stopDisplayLink;
+- (void)handleDisplayLink:(CADisplayLink *)displayLink;
 - (void)drawFrame;
 - (void)installDemoMenu;
 - (void)updateWindowTitle;
@@ -317,7 +298,7 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     _metricsLabel = MakeHUDLabel(NSMakeRect(12, 262, 346, 60), 11.0, NSColor.whiteColor, NO);
     [_runtimePanel addSubview:_metricsLabel];
 
-    _parameterLabel = MakeHUDLabel(NSMakeRect(12, 206, 346, 52), 11.0, [NSColor colorWithWhite:0.92 alpha:1.0], NO);
+    _parameterLabel = MakeHUDLabel(NSMakeRect(12, 198, 346, 60), 11.0, [NSColor colorWithWhite:0.92 alpha:1.0], NO);
     [_runtimePanel addSubview:_parameterLabel];
 
     NSTextField *timeLabel = MakeHUDLabel(NSMakeRect(12, 184, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
@@ -437,12 +418,11 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
                                  gpuText,
                                  stats.estimatedMemoryMB];
 
-    _parameterLabel.stringValue = [NSString stringWithFormat:@"实时参数\nTimeScale %.2f   Edge %.2f\nExposure %.2f   Bloom %.2f   Particle %.2f",
-                                   stats.timeScale,
-                                   stats.edgeStrength,
-                                   stats.exposure,
-                                   stats.bloomStrength,
-                                   stats.particleStrength];
+    _parameterLabel.stringValue = [NSString stringWithFormat:@"实时参数\nScene %@\nPost %@\nUpscale %@\nFallback %@",
+                                   [_renderer scenePathSummary],
+                                   [_renderer postPathSummary],
+                                   [_renderer upscalePathSummary],
+                                   [_renderer runtimeFallbackSummary]];
 
     _timeScaleValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _timeScaleSlider.doubleValue];
     _edgeGainValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _edgeGainSlider.doubleValue];
@@ -471,7 +451,7 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     NSString *errorPart = _renderer.errorExampleEnabled
                           ? [_renderer errorExampleSummary]
                           : @"错误示例关闭时显示标准实现路径。";
-    _docTextView.string = [NSString stringWithFormat:@"主题 %ld: %@\n\n%@\n\n错误示例开关说明:\n%@",
+    _docTextView.string = [NSString stringWithFormat:@"主题 %ld: %@\n\n%@\n\n错误示例开关说明:\n%@\n\n快捷键:\nE 错误示例开关\nH 显示/隐藏说明页\nC 触发单帧 GPU Capture（写入 /tmp/MetalDemo_frame.gputrace）",
                            (long)_renderer.demoTopic,
                            _renderer.demoTopicTitle,
                            doc,
@@ -568,6 +548,12 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
         return;
     }
 
+    if (c == 'c' || c == 'C')
+    {
+        [_renderer requestOneFrameCapture];
+        return;
+    }
+
     if (c >= '0' && c <= '9')
     {
         if (_topicInputBuffer.length == 0)
@@ -628,48 +614,26 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
         return YES;
     }
 
-    CVReturn status = CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
-    if (status != kCVReturnSuccess || !_displayLink)
-    {
-        return NO;
-    }
-
+    // On macOS, CADisplayLink must be created via NSScreen (available since macOS 12).
+    // This correctly ties the link to the display the window is on.
     NSScreen *screen = _window.screen ?: [NSScreen mainScreen];
-    NSNumber *screenNumber = screen.deviceDescription[@"NSScreenNumber"];
-    if (screenNumber)
-    {
-        CVDisplayLinkSetCurrentCGDisplay(_displayLink, (CGDirectDisplayID)screenNumber.unsignedIntValue);
-    }
-
-    status = CVDisplayLinkSetOutputCallback(_displayLink, DisplayLinkOutputCallback, (__bridge void *)self);
-    if (status != kCVReturnSuccess)
-    {
-        CVDisplayLinkRelease(_displayLink);
-        _displayLink = NULL;
-        return NO;
-    }
-
-    status = CVDisplayLinkStart(_displayLink);
-    if (status != kCVReturnSuccess)
-    {
-        CVDisplayLinkRelease(_displayLink);
-        _displayLink = NULL;
-        return NO;
-    }
-
-    return YES;
+    _displayLink = [screen displayLinkWithTarget:self
+                                        selector:@selector(handleDisplayLink:)];
+    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop]
+                       forMode:NSRunLoopCommonModes];
+    return (_displayLink != nil);
 }
 
 - (void)stopDisplayLink
 {
-    if (!_displayLink)
-    {
-        return;
-    }
+    [_displayLink invalidate];
+    _displayLink = nil;
+}
 
-    CVDisplayLinkStop(_displayLink);
-    CVDisplayLinkRelease(_displayLink);
-    _displayLink = NULL;
+- (void)handleDisplayLink:(CADisplayLink *)displayLink
+{
+    (void)displayLink;
+    [self drawFrame];
 }
 
 - (void)drawFrame
@@ -681,11 +645,25 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
 
     CAMetalLayer *metalLayer = (CAMetalLayer *)_metalView.layer;
     metalLayer.frame = _metalView.bounds;
-    metalLayer.contentsScale = [_window backingScaleFactor];
-    metalLayer.drawableSize = CGSizeMake(_metalView.bounds.size.width * metalLayer.contentsScale,
-                                         _metalView.bounds.size.height * metalLayer.contentsScale);
+    CGFloat scale = [_window backingScaleFactor];
+    metalLayer.contentsScale = scale;
+    // Only update drawableSize when the window actually resizes — avoids a
+    // CALayer property write and potential implicit synchronization every frame.
+    CGSize newDrawableSize = CGSizeMake(_metalView.bounds.size.width  * scale,
+                                        _metalView.bounds.size.height * scale);
+    if (!CGSizeEqualToSize(newDrawableSize, _lastDrawableSize))
+    {
+        metalLayer.drawableSize = newDrawableSize;
+        _lastDrawableSize = newDrawableSize;
+    }
     [_renderer render];
-    [self refreshRuntimePanel];
+
+    // Throttle HUD refresh to ~5 fps; interactive changes call refreshRuntimePanel directly.
+    if (++_hudRefreshCounter >= 12)
+    {
+        _hudRefreshCounter = 0;
+        [self refreshRuntimePanel];
+    }
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender

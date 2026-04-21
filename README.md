@@ -22,6 +22,56 @@ Renderer.render()
            resolve -> drawable.texture
 ```
 
+## 技术章节：本轮改动与优化总结
+
+### 1. 交互与教学能力增强
+
+- 新增实时参数面板：显示 CPU 帧时、GPU 帧时、显存估算、当前主题参数。
+- 新增说明页：每个主题提供原理、实现、常见坑、性能建议。
+- 新增错误示例开关：可直接观察“错误配置为什么会慢/会错”。
+- 新增单帧 GPU Capture：按 `C` 可导出 `/tmp/MetalDemo_frame.gputrace`。
+
+### 2. 渲染路径可视化
+
+- HUD 现在会显示当前主题实际使用的渲染路径。
+- HUD 进一步拆分为：
+  - `Scene Path`
+  - `Post Path`
+  - `Upscale Path`
+- 同时显示是否发生 fallback，例如：
+  - `ICB pipeline unsupported`
+  - `MetalFX unavailable`
+- 这样可以区分“主题名称”和“当前机器上真实执行的路径”。
+
+### 3. 性能优化点
+
+- Bloom 改为半分辨率处理，显著降低显存和带宽开销。
+- HUD 刷新限频到约 5fps，避免每帧大量 AppKit 字符串更新。
+- 用 `os_unfair_lock` 替换高频指标路径上的 `@synchronized`。
+- 静态几何 buffer 改为 `Private`，通过 staging buffer 上传。
+- history blit 条件收紧，避免无意义的全屏 copy。
+- 避免 deferred-like 主题重复执行同一轮 edge compute。
+
+### 4. 稳定性修复点
+
+- 场景 4（ICB）从“初始化失败直接导致应用无法启动”改为“不可用时自动回退 direct draw”。
+- ICB 专用 fragment 现在完全不依赖 fragment 资源，使其更符合 ICB 兼容约束。
+- 场景 4 已升级为 `3 个对象 / 3 条 ICB 命令` 的多命令示例，而不再只是单 draw demo。
+- MetalFX 路径不可用时自动回退到 compute upscale。
+- DisplayLink 已迁移到更现代的 macOS 路径，避免旧接口弃用问题。
+- `CFBundleIdentifier` 和 `LSMinimumSystemVersion` 构建 warning 已通过 plist/CMake 对齐清理。
+
+### 5. 当前项目的工程化结论
+
+- 这是一个“单工程、多主题、可交互、可观测、可 profile、可降级”的 Metal 教学 Demo。
+- 每个主题不只展示概念，还尽量暴露真实工程问题：性能、兼容性、fallback、调试与可视化。
+- 目前最有价值的主题包括：
+  - 4：ICB 与 fallback
+  - 5：Parallel Encoder
+  - 8：PBR
+  - 14：MetalFX / compute upscale 对比
+  - 15：GPU Capture 与 Profiling
+
 ## 主题切换方式
 
 - 菜单: Demo -> 1..15

@@ -34,16 +34,16 @@ target_compile_options(${APP_NAME} PRIVATE
 
 find_library(COCOA_FRAMEWORK Cocoa REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
+find_library(METALFX_FRAMEWORK MetalFX REQUIRED)
 find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
-find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 
 target_link_libraries(${APP_NAME} PRIVATE
     ${COCOA_FRAMEWORK}
     ${METAL_FRAMEWORK}
+    ${METALFX_FRAMEWORK}
     ${QUARTZCORE_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
-    ${COREVIDEO_FRAMEWORK}
 )
 
 set_source_files_properties(${METAL_SHADER} PROPERTIES
@@ -52,4 +52,7 @@ set_source_files_properties(${METAL_SHADER} PROPERTIES
 
 set_target_properties(${APP_NAME} PROPERTIES
     MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.example.metalcmakedemo"
+    MACOSX_DEPLOYMENT_TARGET "14.0"
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.example.metalcmakedemo"
 )

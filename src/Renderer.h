@@ -50,6 +50,12 @@ typedef struct
 - (void)setUserParameterTimeScale:(float)timeScale edgeGain:(float)edgeGain exposureGain:(float)exposureGain;
 - (MetalDemoRuntimeStats)runtimeStats;
 - (NSString *)errorExampleSummary;
+- (void)requestOneFrameCapture;
+- (NSString *)scenePathSummary;
+- (NSString *)postPathSummary;
+- (NSString *)upscalePathSummary;
+- (NSString *)runtimePathSummary;
+- (NSString *)runtimeFallbackSummary;
 
 + (NSArray<NSString *> *)allDemoTopicTitles;
 

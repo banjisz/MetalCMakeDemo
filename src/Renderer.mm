@@ -1,5 +1,7 @@
 #import "Renderer.h"
 #include <simd/simd.h>
+#include <os/lock.h>
+#import <MetalFX/MetalFX.h>
 
 static const NSUInteger kMaxFramesInFlight = 3;
 static const NSUInteger kSampleCount = 4;
@@ -14,6 +16,7 @@ typedef struct
 
 typedef struct
 {
+    matrix_float4x4 viewProjectionMatrix;
     matrix_float4x4 modelViewProjectionMatrix;
     matrix_float4x4 modelMatrix;
     simd_float3 lightDirection;
@@ -23,6 +26,13 @@ typedef struct
     uint32_t demoTopic;
     uint32_t featureFlags;
 } Uniforms;
+
+typedef struct
+{
+    matrix_float4x4 modelMatrix;
+    simd_float3 tint;
+    float pad;
+} InstanceData;
 
 typedef struct
 {
@@ -132,6 +142,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     id<MTLCommandQueue> _commandQueue;
 
     id<MTLRenderPipelineState> _scenePipelineState;
+    id<MTLRenderPipelineState> _sceneICBPipelineState;
     id<MTLRenderPipelineState> _scenePBRPipelineState;
     id<MTLRenderPipelineState> _sceneShadowPipelineState;
     id<MTLRenderPipelineState> _sceneArgumentBufferPipelineState;
@@ -154,6 +165,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 
     id<MTLBuffer> _vertexBuffer;
     id<MTLBuffer> _indexBuffer;
+    id<MTLBuffer> _instanceBuffer;
     NSUInteger _indexCount;
     id<MTLBuffer> _uniformBuffers[kMaxFramesInFlight];
 
@@ -178,6 +190,11 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     MetalDemoTopic _demoTopic;
     BOOL _historyValid;
     BOOL _supportsRayTracing;
+    BOOL _captureNextFrame;
+
+    id<MTLFXSpatialScaler> _spatialScaler API_AVAILABLE(macos(13.0));
+
+    os_unfair_lock _metricsLock;
 
     BOOL _errorExampleEnabled;
     float _userTimeScaleGain;
@@ -193,6 +210,10 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     float _lastBloomStrength;
     float _lastParticleStrength;
     float _lastTemporalBlend;
+    NSString *_lastScenePathSummary;
+    NSString *_lastPostPathSummary;
+    NSString *_lastUpscalePathSummary;
+    NSString *_lastRuntimeFallbackSummary;
 }
 
 - (uint64_t)estimatedVideoMemoryBytes;
@@ -256,20 +277,52 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 - (MetalDemoRuntimeStats)runtimeStats
 {
     MetalDemoRuntimeStats stats;
-    @synchronized (self)
-    {
-        stats.cpuFrameTimeMs = _lastCPUFrameTimeMs;
-        stats.gpuFrameTimeMs = _lastGPUFrameTimeMs;
-        stats.estimatedMemoryMB = _lastEstimatedMemoryMB;
-        stats.timeScale = _lastTimeScale;
-        stats.edgeStrength = _lastEdgeStrength;
-        stats.exposure = _lastExposure;
-        stats.bloomStrength = _lastBloomStrength;
-        stats.particleStrength = _lastParticleStrength;
-        stats.temporalBlend = _lastTemporalBlend;
-        stats.errorExampleEnabled = _errorExampleEnabled;
-    }
+    os_unfair_lock_lock(&_metricsLock);
+    stats.cpuFrameTimeMs      = _lastCPUFrameTimeMs;
+    stats.gpuFrameTimeMs      = _lastGPUFrameTimeMs;
+    stats.estimatedMemoryMB   = _lastEstimatedMemoryMB;
+    stats.timeScale           = _lastTimeScale;
+    stats.edgeStrength        = _lastEdgeStrength;
+    stats.exposure            = _lastExposure;
+    stats.bloomStrength       = _lastBloomStrength;
+    stats.particleStrength    = _lastParticleStrength;
+    stats.temporalBlend       = _lastTemporalBlend;
+    stats.errorExampleEnabled = _errorExampleEnabled;
+    os_unfair_lock_unlock(&_metricsLock);
     return stats;
+}
+
+- (void)requestOneFrameCapture
+{
+    _captureNextFrame = YES;
+}
+
+- (NSString *)scenePathSummary
+{
+    return _lastScenePathSummary ?: @"Standard Direct";
+}
+
+- (NSString *)postPathSummary
+{
+    return _lastPostPathSummary ?: @"Post Composite";
+}
+
+- (NSString *)upscalePathSummary
+{
+    return _lastUpscalePathSummary ?: @"Off";
+}
+
+- (NSString *)runtimePathSummary
+{
+    return [NSString stringWithFormat:@"%@ / %@ / %@",
+            [self scenePathSummary],
+            [self postPathSummary],
+            [self upscalePathSummary]];
+}
+
+- (NSString *)runtimeFallbackSummary
+{
+    return _lastRuntimeFallbackSummary ?: @"No";
 }
 
 - (NSString *)errorExampleSummary
@@ -303,9 +356,9 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         case MetalDemoTopicRayTracing:
             return @"在回退路径上叠加负载，演示能力探测与降级策略不足的问题。";
         case MetalDemoTopicMetalFXLike:
-            return @"提升 temporal 与曝光，演示上采样链路中的鬼影和光晕。";
+            return @"提升 temporal 与曝光，演示 MetalFX 上采样链路中鬼影、光晕与过锐化。";
         case MetalDemoTopicProfiling:
-            return @"增加冗余 compute 轮次，便于在 capture 中观察热点阶段。";
+            return @"增加冗余 compute 轮次；按 C 触发单帧 GPU Capture 观察热点阶段。";
     }
 
     return @"错误示例未定义。";
@@ -479,10 +532,14 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     postMSAADescriptor.usage = MTLTextureUsageRenderTarget;
     _postMSAATexture = [_device newTextureWithDescriptor:postMSAADescriptor];
 
+    NSUInteger halfWidth  = MAX((NSUInteger)1, width / 2);
+    NSUInteger halfHeight = MAX((NSUInteger)1, height / 2);
+
+    // Bloom at half-resolution: same perceptual quality, 4x less VRAM and GPU bandwidth.
     MTLTextureDescriptor *bloomDescriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
-                                                           width:width
-                                                          height:height
+                                                           width:halfWidth
+                                                          height:halfHeight
                                                        mipmapped:NO];
     bloomDescriptor.storageMode = MTLStorageModePrivate;
     bloomDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
@@ -504,11 +561,10 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
                                                           height:height
                                                        mipmapped:NO];
     historyDescriptor.storageMode = MTLStorageModePrivate;
-    historyDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+    // Only ShaderRead needed: post_fragment samples it; blit writes to it (no usage flag required).
+    historyDescriptor.usage = MTLTextureUsageShaderRead;
     _historyTexture = [_device newTextureWithDescriptor:historyDescriptor];
 
-    NSUInteger halfWidth = MAX((NSUInteger)1, width / 2);
-    NSUInteger halfHeight = MAX((NSUInteger)1, height / 2);
     MTLTextureDescriptor *halfDescriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                                            width:halfWidth
@@ -526,6 +582,20 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     upscaledDescriptor.storageMode = MTLStorageModePrivate;
     upscaledDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     _upscaledTexture = [_device newTextureWithDescriptor:upscaledDescriptor];
+
+    // MetalFX Spatial Scaler (macOS 13+) for topic 14 high-quality upscale.
+    if (@available(macOS 13.0, *))
+    {
+        MTLFXSpatialScalerDescriptor *scalerDesc = [[MTLFXSpatialScalerDescriptor alloc] init];
+        scalerDesc.inputWidth   = halfWidth;
+        scalerDesc.inputHeight  = halfHeight;
+        scalerDesc.outputWidth  = width;
+        scalerDesc.outputHeight = height;
+        scalerDesc.colorTextureFormat  = MTLPixelFormatRGBA16Float;
+        scalerDesc.outputTextureFormat = MTLPixelFormatRGBA16Float;
+        scalerDesc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        _spatialScaler = [scalerDesc newSpatialScalerWithDevice:_device];
+    }
 
     _historyValid = NO;
 }
@@ -549,6 +619,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 
     total += _vertexBuffer ? _vertexBuffer.length : 0;
     total += _indexBuffer ? _indexBuffer.length : 0;
+    total += _instanceBuffer ? _instanceBuffer.length : 0;
     total += _materialArgumentBuffer ? _materialArgumentBuffer.length : 0;
     for (NSUInteger i = 0; i < kMaxFramesInFlight; ++i)
     {
@@ -594,6 +665,10 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         _lastBloomStrength = 0.0f;
         _lastParticleStrength = 0.0f;
         _lastTemporalBlend = 0.0f;
+        _lastScenePathSummary = @"Standard Direct";
+        _lastPostPathSummary = @"Post Composite";
+        _lastUpscalePathSummary = @"Off";
+        _lastRuntimeFallbackSummary = @"No";
 
         _commandQueue = [_device newCommandQueue];
         if (!_commandQueue)
@@ -622,6 +697,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         }
 
         id<MTLFunction> sceneVertex = [library newFunctionWithName:@"scene_vertex"];
+        id<MTLFunction> sceneFragmentICB = [library newFunctionWithName:@"scene_fragment_icb"];
         id<MTLFunction> postVertex = [library newFunctionWithName:@"post_vertex"];
         id<MTLFunction> postFragment = [library newFunctionWithName:@"post_fragment"];
         id<MTLFunction> edgeKernel = [library newFunctionWithName:@"edge_detect_kernel"];
@@ -631,7 +707,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         id<MTLFunction> downsampleKernel = [library newFunctionWithName:@"downsample_half_kernel"];
         id<MTLFunction> upscaleKernel = [library newFunctionWithName:@"upscale_linear_kernel"];
 
-        if (!sceneVertex || !postVertex || !postFragment || !edgeKernel || !brightKernel ||
+        if (!sceneVertex || !sceneFragmentICB || !postVertex || !postFragment || !edgeKernel || !brightKernel ||
             !blurKernel || !particleKernel || !downsampleKernel || !upscaleKernel)
         {
             NSLog(@"Failed to load one or more Metal shader functions.");
@@ -670,6 +746,16 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         scenePipelineDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         scenePipelineDescriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         scenePipelineDescriptor.rasterSampleCount = kSampleCount;
+
+        MTLRenderPipelineDescriptor *sceneICBPipelineDescriptor = [scenePipelineDescriptor copy];
+        sceneICBPipelineDescriptor.fragmentFunction = sceneFragmentICB;
+        sceneICBPipelineDescriptor.supportIndirectCommandBuffers = YES;
+        _sceneICBPipelineState = [_device newRenderPipelineStateWithDescriptor:sceneICBPipelineDescriptor error:&error];
+        if (!_sceneICBPipelineState)
+        {
+            NSLog(@"ICB scene pipeline unavailable, topic 4 will fall back to direct draw: %@", error);
+            error = nil;
+        }
 
         _scenePipelineState = [_device newRenderPipelineStateWithDescriptor:scenePipelineDescriptor error:&error];
         if (!_scenePipelineState)
@@ -792,12 +878,11 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         icbDescriptor.maxVertexBufferBindCount = 0;
         icbDescriptor.maxFragmentBufferBindCount = 0;
         _indirectCommandBuffer = [_device newIndirectCommandBufferWithDescriptor:icbDescriptor
-                                                                   maxCommandCount:1
+                                       maxCommandCount:3
                                                                            options:0];
         if (!_indirectCommandBuffer)
         {
-            NSLog(@"Failed to create indirect command buffer.");
-            return nil;
+            NSLog(@"Indirect command buffer unavailable, topic 4 will fall back to direct draw.");
         }
 
         static const Vertex cubeVertices[] = {
@@ -841,28 +926,41 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
             20, 21, 22, 22, 23, 20
         };
 
-        _vertexBuffer = [_device newBufferWithBytes:cubeVertices
-                                              length:sizeof(cubeVertices)
-                                             options:MTLResourceStorageModeShared];
-        _indexBuffer = [_device newBufferWithBytes:cubeIndices
-                                             length:sizeof(cubeIndices)
-                                            options:MTLResourceStorageModeShared];
+        // Stage through Shared buffers then copy to Private for optimal GPU cache behavior.
+        id<MTLBuffer> vertexStaging = [_device newBufferWithBytes:cubeVertices
+                                                            length:sizeof(cubeVertices)
+                                                           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> indexStaging  = [_device newBufferWithBytes:cubeIndices
+                                                           length:sizeof(cubeIndices)
+                                                          options:MTLResourceStorageModeShared];
+        _vertexBuffer = [_device newBufferWithLength:sizeof(cubeVertices)
+                                              options:MTLResourceStorageModePrivate];
+        _indexBuffer  = [_device newBufferWithLength:sizeof(cubeIndices)
+                                              options:MTLResourceStorageModePrivate];
+                _instanceBuffer = [_device newBufferWithLength:sizeof(InstanceData) * 3
+                                                                                             options:MTLResourceStorageModeShared];
         _indexCount = sizeof(cubeIndices) / sizeof(cubeIndices[0]);
-        if (!_vertexBuffer || !_indexBuffer)
+                if (!vertexStaging || !indexStaging || !_vertexBuffer || !_indexBuffer || !_instanceBuffer)
         {
             NSLog(@"Failed to create mesh buffers.");
             return nil;
         }
 
-                id<MTLIndirectRenderCommand> prebuiltICBCommand = [_indirectCommandBuffer indirectRenderCommandAtIndex:0];
-                [prebuiltICBCommand drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                                                             indexCount:_indexCount
-                                                                                indexType:MTLIndexTypeUInt16
-                                                                            indexBuffer:_indexBuffer
-                                                                indexBufferOffset:0
-                                                                        instanceCount:1
-                                                                             baseVertex:0
-                                                                         baseInstance:0];
+                if (_indirectCommandBuffer)
+                {
+                        for (NSUInteger commandIndex = 0; commandIndex < 3; ++commandIndex)
+                        {
+                                id<MTLIndirectRenderCommand> prebuiltICBCommand = [_indirectCommandBuffer indirectRenderCommandAtIndex:commandIndex];
+                                [prebuiltICBCommand drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                                                                                 indexCount:_indexCount
+                                                                                                    indexType:MTLIndexTypeUInt16
+                                                                                                indexBuffer:_indexBuffer
+                                                                                    indexBufferOffset:0
+                                                                                            instanceCount:1
+                                                                                                     baseVertex:0
+                                                                                                 baseInstance:commandIndex];
+                        }
+                }
 
         for (NSUInteger i = 0; i < kMaxFramesInFlight; ++i)
         {
@@ -889,6 +987,13 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 
         id<MTLCommandBuffer> setupCommandBuffer = [_commandQueue commandBuffer];
         id<MTLBlitCommandEncoder> setupBlit = [setupCommandBuffer blitCommandEncoder];
+        // Upload static geometry to Private GPU memory.
+        [setupBlit copyFromBuffer:vertexStaging sourceOffset:0
+                        toBuffer:_vertexBuffer destinationOffset:0
+                            size:sizeof(cubeVertices)];
+        [setupBlit copyFromBuffer:indexStaging sourceOffset:0
+                        toBuffer:_indexBuffer  destinationOffset:0
+                            size:sizeof(cubeIndices)];
         [setupBlit generateMipmapsForTexture:_albedoTexture];
         [setupBlit generateMipmapsForTexture:_normalTexture];
         [setupBlit endEncoding];
@@ -896,6 +1001,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         [setupCommandBuffer waitUntilCompleted];
 
         _historyValid = NO;
+        _metricsLock = OS_UNFAIR_LOCK_INIT;
     }
 
     return self;
@@ -907,6 +1013,26 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     {
         CFAbsoluteTime cpuFrameStart = CFAbsoluteTimeGetCurrent();
         dispatch_semaphore_wait(_inFlightSemaphore, DISPATCH_TIME_FOREVER);
+
+        // GPU Capture: if requested, start a one-frame capture to /tmp for Xcode analysis.
+        BOOL capturing = NO;
+        if (_captureNextFrame)
+        {
+            _captureNextFrame = NO;
+            MTLCaptureManager *mgr = [MTLCaptureManager sharedCaptureManager];
+            MTLCaptureDescriptor *desc = [[MTLCaptureDescriptor alloc] init];
+            desc.captureObject = _device;
+            desc.destination   = MTLCaptureDestinationGPUTraceDocument;
+            NSString *path     = [NSTemporaryDirectory()
+                                  stringByAppendingPathComponent:@"MetalDemo_frame.gputrace"];
+            desc.outputURL = [NSURL fileURLWithPath:path];
+            NSError *captureErr = nil;
+            capturing = [mgr startCaptureWithDescriptor:desc error:&captureErr];
+            if (capturing)
+                NSLog(@"[Capture] GPU trace started → %@", path);
+            else
+                NSLog(@"[Capture] Failed: %@", captureErr.localizedDescription);
+        }
 
         if (_errorExampleEnabled && _demoTopic == MetalDemoTopicResourceMemory)
         {
@@ -935,16 +1061,18 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         }
 
         __block dispatch_semaphore_t semaphore = _inFlightSemaphore;
+        __block BOOL wasCapturing = capturing;
         [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull buffer) {
+            if (wasCapturing)
+                [[MTLCaptureManager sharedCaptureManager] stopCapture];
             double gpuFrameMs = -1.0;
             if (buffer.GPUEndTime > buffer.GPUStartTime)
             {
                 gpuFrameMs = (buffer.GPUEndTime - buffer.GPUStartTime) * 1000.0;
             }
-            @synchronized (self)
-            {
-                _lastGPUFrameTimeMs = gpuFrameMs;
-            }
+            os_unfair_lock_lock(&self->_metricsLock);
+            self->_lastGPUFrameTimeMs = gpuFrameMs;
+            os_unfair_lock_unlock(&self->_metricsLock);
             dispatch_semaphore_signal(semaphore);
         }];
 
@@ -963,9 +1091,11 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 
         BOOL useArgumentBuffer = (_demoTopic == MetalDemoTopicArgumentBuffer);
         // Keep argument buffer resources bound for learning, but use shader fallback for stability.
-        BOOL useArgumentShader = NO;
-        // ICB compatibility fallback: keep topic hooks but use direct draw path for stability.
-        BOOL useICB = NO;
+        BOOL useArgumentShader = (_demoTopic == MetalDemoTopicArgumentBuffer);
+        // Topic 4 uses real ICB only when both the ICB pipeline and ICB buffer are available.
+        BOOL useICB = (_demoTopic == MetalDemoTopicIndirectCommandBuffer) &&
+                  (_sceneICBPipelineState != nil) &&
+                  (_indirectCommandBuffer != nil);
         BOOL useParallel = (_demoTopic == MetalDemoTopicParallelEncoding);
         BOOL useDeferredLike = (_demoTopic == MetalDemoTopicDeferredLike);
         BOOL useShadow = (_demoTopic == MetalDemoTopicShadowing);
@@ -1113,17 +1243,105 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         edgeStrength = fmaxf(0.0f, edgeStrength * _userEdgeGain);
         exposureBias = fmaxf(0.1f, exposureBias * _userExposureGain);
 
+        if (_demoTopic == MetalDemoTopicIndirectCommandBuffer)
+        {
+            if (useICB)
+            {
+                _lastScenePathSummary = @"ICB ExecuteCommands (3 cmds / 3 objs)";
+                _lastPostPathSummary = @"Post Composite";
+                _lastUpscalePathSummary = @"Off";
+                _lastRuntimeFallbackSummary = @"No";
+            }
+            else if (_sceneICBPipelineState == nil)
+            {
+                _lastScenePathSummary = @"Direct Draw";
+                _lastPostPathSummary = @"Post Composite";
+                _lastUpscalePathSummary = @"Off";
+                _lastRuntimeFallbackSummary = @"Yes: ICB pipeline unsupported";
+            }
+            else
+            {
+                _lastScenePathSummary = @"Direct Draw";
+                _lastPostPathSummary = @"Post Composite";
+                _lastUpscalePathSummary = @"Off";
+                _lastRuntimeFallbackSummary = @"Yes: ICB buffer unavailable";
+            }
+        }
+        else if (_demoTopic == MetalDemoTopicParallelEncoding)
+        {
+            _lastScenePathSummary = @"Parallel Encoder";
+            _lastPostPathSummary = @"Post Composite";
+            _lastUpscalePathSummary = @"Off";
+            _lastRuntimeFallbackSummary = @"No";
+        }
+        else if (_demoTopic == MetalDemoTopicArgumentBuffer)
+        {
+            _lastScenePathSummary = @"Argument Buffer Shader";
+            _lastPostPathSummary = @"Post Composite";
+            _lastUpscalePathSummary = @"Off";
+            _lastRuntimeFallbackSummary = @"No";
+        }
+        else if (_demoTopic == MetalDemoTopicMetalFXLike)
+        {
+            if (_spatialScaler != nil)
+            {
+                _lastScenePathSummary = @"Standard Direct";
+                _lastPostPathSummary = @"Post Composite + Temporal";
+                _lastUpscalePathSummary = @"MetalFX Spatial Scaler";
+                _lastRuntimeFallbackSummary = @"No";
+            }
+            else
+            {
+                _lastScenePathSummary = @"Standard Direct";
+                _lastPostPathSummary = @"Post Composite + Temporal";
+                _lastUpscalePathSummary = @"Compute Bilinear";
+                _lastRuntimeFallbackSummary = @"Yes: MetalFX unavailable";
+            }
+        }
+        else if (usePBR)
+        {
+            _lastScenePathSummary = @"PBR Pipeline";
+            _lastPostPathSummary = @"Post Composite";
+            _lastUpscalePathSummary = @"Off";
+            _lastRuntimeFallbackSummary = @"No";
+        }
+        else if (useShadow)
+        {
+            _lastScenePathSummary = @"Shadow Pipeline";
+            _lastPostPathSummary = @"Post Composite";
+            _lastUpscalePathSummary = @"Off";
+            _lastRuntimeFallbackSummary = @"No";
+        }
+        else if (useDeferredLike)
+        {
+            _lastScenePathSummary = @"Standard Direct";
+            _lastPostPathSummary = @"Edge Compute + Post Composite";
+            _lastUpscalePathSummary = @"Off";
+            _lastRuntimeFallbackSummary = @"No";
+        }
+        else
+        {
+            _lastScenePathSummary = @"Standard Direct";
+            _lastPostPathSummary = (useBloom || useParticles || temporalBlend > 0.0f)
+                                   ? @"Post Composite + Effects"
+                                   : @"Post Composite";
+            _lastUpscalePathSummary = @"Off";
+            _lastRuntimeFallbackSummary = @"No";
+        }
+
         elapsed *= timeScale;
         Uniforms *uniforms = (Uniforms *)_uniformBuffers[uniformIndex].contents;
 
         float aspect = (float)_sceneResolveTexture.width / (float)MAX((NSUInteger)1, _sceneResolveTexture.height);
         matrix_float4x4 projection = matrix_perspective(65.0f * ((float)M_PI / 180.0f), aspect, 0.1f, 100.0f);
         matrix_float4x4 view = matrix_translation(0.0f, 0.0f, -5.2f);
+        matrix_float4x4 viewProjection = matrix_multiply(projection, view);
         matrix_float4x4 rotationY = matrix_rotation(elapsed * 0.8f, (vector_float3){0.0f, 1.0f, 0.0f});
         matrix_float4x4 rotationX = matrix_rotation(elapsed * 0.5f, (vector_float3){1.0f, 0.0f, 0.0f});
         matrix_float4x4 model = matrix_multiply(rotationY, rotationX);
         matrix_float4x4 mv = matrix_multiply(view, model);
 
+        uniforms->viewProjectionMatrix = viewProjection;
         uniforms->modelViewProjectionMatrix = matrix_multiply(projection, mv);
         uniforms->modelMatrix = model;
         uniforms->lightDirection = simd_normalize((vector_float3){0.5f, 0.8f, 0.4f});
@@ -1134,8 +1352,36 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         uniforms->featureFlags = (useBloom ? 1u : 0u) | (useParticles ? 2u : 0u) |
                                  (useRayTraceMode ? 4u : 0u) | (useUpscale ? 8u : 0u);
 
+        if (_instanceBuffer)
+        {
+            InstanceData *instances = (InstanceData *)_instanceBuffer.contents;
+            simd_float3 tints[3] = {
+                {1.00f, 0.72f, 0.72f},
+                {0.72f, 1.00f, 0.80f},
+                {0.74f, 0.84f, 1.00f}
+            };
+            float xOffsets[3] = {-2.35f, 0.0f, 2.35f};
+            float phaseOffsets[3] = {0.0f, 1.4f, 2.8f};
+            for (NSUInteger i = 0; i < 3; ++i)
+            {
+                matrix_float4x4 localRotY = matrix_rotation(elapsed * (0.75f + 0.12f * (float)i) + phaseOffsets[i],
+                                                            (vector_float3){0.0f, 1.0f, 0.0f});
+                matrix_float4x4 localRotX = matrix_rotation(elapsed * (0.45f + 0.08f * (float)i),
+                                                            (vector_float3){1.0f, 0.0f, 0.0f});
+                matrix_float4x4 localModel = matrix_multiply(matrix_translation(xOffsets[i], 0.0f, 0.0f),
+                                                             matrix_multiply(localRotY, localRotX));
+                instances[i].modelMatrix = localModel;
+                instances[i].tint = tints[i];
+                instances[i].pad = 0.0f;
+            }
+        }
+
         id<MTLRenderPipelineState> selectedScenePipeline = _scenePipelineState;
-        if (useArgumentShader)
+        if (useICB)
+        {
+            selectedScenePipeline = _sceneICBPipelineState;
+        }
+        else if (useArgumentShader)
         {
             selectedScenePipeline = _sceneArgumentBufferPipelineState;
         }
@@ -1163,6 +1409,8 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 
         if (useParallel)
         {
+            // Topic 5: True parallel encoding — two GCD threads record into two sub-encoders
+            // concurrently. The parallel encoder merges them in declaration order.
             id<MTLParallelRenderCommandEncoder> parallelEncoder =
                 [commandBuffer parallelRenderCommandEncoderWithDescriptor:scenePass];
             if (!parallelEncoder)
@@ -1171,37 +1419,78 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
                 return;
             }
 
-            id<MTLRenderCommandEncoder> sceneEncoder = [parallelEncoder renderCommandEncoder];
-            if (!sceneEncoder)
+            // Create both sub-encoders upfront (thread-safe on parallelEncoder).
+            id<MTLRenderCommandEncoder> enc1 = [parallelEncoder renderCommandEncoder];
+            id<MTLRenderCommandEncoder> enc2 = [parallelEncoder renderCommandEncoder];
+            if (!enc1 || !enc2)
             {
+                [parallelEncoder endEncoding];
                 dispatch_semaphore_signal(_inFlightSemaphore);
                 return;
             }
 
-            [sceneEncoder setRenderPipelineState:selectedScenePipeline];
-            [sceneEncoder setDepthStencilState:_depthState];
-            [sceneEncoder setCullMode:MTLCullModeBack];
-            [sceneEncoder setFrontFacingWinding:MTLWindingCounterClockwise];
-            [sceneEncoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
-            [sceneEncoder setVertexBuffer:_uniformBuffers[uniformIndex] offset:0 atIndex:1];
-            [sceneEncoder setFragmentBuffer:_uniformBuffers[uniformIndex] offset:0 atIndex:1];
-            [sceneEncoder setFragmentBuffer:_materialArgumentBuffer offset:0 atIndex:2];
-            [sceneEncoder setFragmentSamplerState:sceneSampler atIndex:0];
-            if (useArgumentShader)
-            {
-                // Argument-buffer topic: resource fetches use buffer index 2.
-            }
-            else
-            {
-                [sceneEncoder setFragmentTexture:_albedoTexture atIndex:0];
-                [sceneEncoder setFragmentTexture:_normalTexture atIndex:1];
-            }
-            [sceneEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                      indexCount:_indexCount
-                                       indexType:MTLIndexTypeUInt16
-                                     indexBuffer:_indexBuffer
-                               indexBufferOffset:0];
-            [sceneEncoder endEncoding];
+            // Split the cube: first 3 faces (enc1) and last 3 faces (enc2).
+            NSUInteger halfCount  = _indexCount / 2;
+            NSUInteger halfOffset = halfCount * sizeof(uint16_t);
+
+            // Capture Metal object refs as locals for safe block capture.
+            __block id<MTLRenderPipelineState> cap_pipeline  = selectedScenePipeline;
+            __block id<MTLDepthStencilState>   cap_depth     = _depthState;
+            __block id<MTLBuffer>              cap_vbuf      = _vertexBuffer;
+            __block id<MTLBuffer>              cap_ubuf      = _uniformBuffers[uniformIndex];
+            __block id<MTLBuffer>              cap_instbuf   = _instanceBuffer;
+            __block id<MTLBuffer>              cap_mbuf      = _materialArgumentBuffer;
+            __block id<MTLBuffer>              cap_ibuf      = _indexBuffer;
+            __block id<MTLTexture>             cap_albedo    = _albedoTexture;
+            __block id<MTLTexture>             cap_normal    = _normalTexture;
+            __block id<MTLSamplerState>        cap_samp      = _samplerState;
+
+            dispatch_group_t group = dispatch_group_create();
+            dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+
+            dispatch_group_async(group, queue, ^{
+                [enc1 setRenderPipelineState:cap_pipeline];
+                [enc1 setDepthStencilState:cap_depth];
+                [enc1 setCullMode:MTLCullModeBack];
+                [enc1 setFrontFacingWinding:MTLWindingCounterClockwise];
+                [enc1 setVertexBuffer:cap_vbuf   offset:0 atIndex:0];
+                [enc1 setVertexBuffer:cap_ubuf   offset:0 atIndex:1];
+                [enc1 setVertexBuffer:cap_instbuf offset:0 atIndex:2];
+                [enc1 setFragmentBuffer:cap_ubuf  offset:0 atIndex:1];
+                [enc1 setFragmentBuffer:cap_mbuf  offset:0 atIndex:2];
+                [enc1 setFragmentTexture:cap_albedo atIndex:0];
+                [enc1 setFragmentTexture:cap_normal atIndex:1];
+                [enc1 setFragmentSamplerState:cap_samp atIndex:0];
+                [enc1 drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                 indexCount:halfCount
+                                  indexType:MTLIndexTypeUInt16
+                                indexBuffer:cap_ibuf
+                          indexBufferOffset:0];
+                [enc1 endEncoding];
+            });
+
+            dispatch_group_async(group, queue, ^{
+                [enc2 setRenderPipelineState:cap_pipeline];
+                [enc2 setDepthStencilState:cap_depth];
+                [enc2 setCullMode:MTLCullModeBack];
+                [enc2 setFrontFacingWinding:MTLWindingCounterClockwise];
+                [enc2 setVertexBuffer:cap_vbuf   offset:0 atIndex:0];
+                [enc2 setVertexBuffer:cap_ubuf   offset:0 atIndex:1];
+                [enc2 setVertexBuffer:cap_instbuf offset:0 atIndex:2];
+                [enc2 setFragmentBuffer:cap_ubuf  offset:0 atIndex:1];
+                [enc2 setFragmentBuffer:cap_mbuf  offset:0 atIndex:2];
+                [enc2 setFragmentTexture:cap_albedo atIndex:0];
+                [enc2 setFragmentTexture:cap_normal atIndex:1];
+                [enc2 setFragmentSamplerState:cap_samp atIndex:0];
+                [enc2 drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                 indexCount:_indexCount - halfCount
+                                  indexType:MTLIndexTypeUInt16
+                                indexBuffer:cap_ibuf
+                          indexBufferOffset:halfOffset];
+                [enc2 endEncoding];
+            });
+
+            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
             [parallelEncoder endEncoding];
         }
         else
@@ -1227,31 +1516,23 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
             {
                 [sceneEncoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
                 [sceneEncoder setVertexBuffer:_uniformBuffers[uniformIndex] offset:0 atIndex:1];
-                [sceneEncoder setFragmentBuffer:_uniformBuffers[uniformIndex] offset:0 atIndex:1];
-                [sceneEncoder setFragmentBuffer:_materialArgumentBuffer offset:0 atIndex:2];
-                [sceneEncoder setFragmentSamplerState:sceneSampler atIndex:0];
-                if (useArgumentShader)
-                {
-                    // Argument-buffer topic: resource fetches use buffer index 2.
-                }
-                else
-                {
-                    [sceneEncoder setFragmentTexture:_albedoTexture atIndex:0];
-                    [sceneEncoder setFragmentTexture:_normalTexture atIndex:1];
-                }
-
-                [sceneEncoder executeCommandsInBuffer:_indirectCommandBuffer withRange:NSMakeRange(0, 1)];
+                [sceneEncoder setVertexBuffer:_instanceBuffer offset:0 atIndex:2];
+                // ICB embeds _indexBuffer: declare it so Metal can track hazards.
+                [sceneEncoder useResource:_indexBuffer usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+                [sceneEncoder executeCommandsInBuffer:_indirectCommandBuffer withRange:NSMakeRange(0, 3)];
             }
             else
             {
                 [sceneEncoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
                 [sceneEncoder setVertexBuffer:_uniformBuffers[uniformIndex] offset:0 atIndex:1];
+                [sceneEncoder setVertexBuffer:_instanceBuffer offset:0 atIndex:2];
                 [sceneEncoder setFragmentBuffer:_uniformBuffers[uniformIndex] offset:0 atIndex:1];
                 [sceneEncoder setFragmentBuffer:_materialArgumentBuffer offset:0 atIndex:2];
                 [sceneEncoder setFragmentSamplerState:sceneSampler atIndex:0];
                 if (useArgumentShader)
                 {
-                    // Argument-buffer topic: resource fetches use buffer index 2.
+                    [sceneEncoder useResource:_albedoTexture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+                    [sceneEncoder useResource:_normalTexture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
                 }
                 else
                 {
@@ -1306,10 +1587,14 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
             tgHeight = 1;
         }
         MTLSize tgSize = MTLSizeMake(tgWidth, tgHeight, 1);
-        [computeEncoder dispatchThreads:grid threadsPerThreadgroup:tgSize];
-        for (uint32_t i = 0; i < extraStressPasses; ++i)
+        // useDeferredLike already ran edge detect in its own encoder; skip here to avoid redundant work.
+        if (!useDeferredLike)
         {
             [computeEncoder dispatchThreads:grid threadsPerThreadgroup:tgSize];
+            for (uint32_t i = 0; i < extraStressPasses; ++i)
+            {
+                [computeEncoder dispatchThreads:grid threadsPerThreadgroup:tgSize];
+            }
         }
         [computeEncoder endEncoding];
 
@@ -1380,11 +1665,34 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
             dispatch2D(downsampleEncoder, _downsamplePipelineState, _halfResTexture.width, _halfResTexture.height);
             [downsampleEncoder endEncoding];
 
-            id<MTLComputeCommandEncoder> upscaleEncoder = [commandBuffer computeCommandEncoder];
-            [upscaleEncoder setTexture:_halfResTexture atIndex:0];
-            [upscaleEncoder setTexture:_upscaledTexture atIndex:1];
-            dispatch2D(upscaleEncoder, _upscalePipelineState, _upscaledTexture.width, _upscaledTexture.height);
-            [upscaleEncoder endEncoding];
+            if (@available(macOS 13.0, *))
+            {
+                if (_spatialScaler != nil)
+                {
+                    // MetalFX Spatial Scaler: high-quality GPU-accelerated upscale in one call.
+                    _spatialScaler.colorTexture  = _halfResTexture;
+                    _spatialScaler.outputTexture = _upscaledTexture;
+                    [_spatialScaler encodeToCommandBuffer:commandBuffer];
+                }
+                else
+                {
+                    // Fallback: manual bilinear compute kernel.
+                    id<MTLComputeCommandEncoder> upscaleEncoder = [commandBuffer computeCommandEncoder];
+                    [upscaleEncoder setTexture:_halfResTexture atIndex:0];
+                    [upscaleEncoder setTexture:_upscaledTexture atIndex:1];
+                    dispatch2D(upscaleEncoder, _upscalePipelineState, _upscaledTexture.width, _upscaledTexture.height);
+                    [upscaleEncoder endEncoding];
+                }
+            }
+            else
+            {
+                // Fallback: manual bilinear compute kernel.
+                id<MTLComputeCommandEncoder> upscaleEncoder = [commandBuffer computeCommandEncoder];
+                [upscaleEncoder setTexture:_halfResTexture atIndex:0];
+                [upscaleEncoder setTexture:_upscaledTexture atIndex:1];
+                dispatch2D(upscaleEncoder, _upscalePipelineState, _upscaledTexture.width, _upscaledTexture.height);
+                [upscaleEncoder endEncoding];
+            }
 
             sceneForPost = _upscaledTexture;
         }
@@ -1425,7 +1733,9 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         [postEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [postEncoder endEncoding];
 
-        if (temporalBlend > 0.0f || useBloom || useUpscale)
+        // Only blit when history is actually consumed next frame.
+        // useBloom sets temporalBlend=0 and never reads history, so omit it.
+        if (temporalBlend > 0.0f || useUpscale)
         {
             id<MTLBlitCommandEncoder> historyBlit = [commandBuffer blitCommandEncoder];
             [historyBlit copyFromTexture:sceneForPost
@@ -1457,17 +1767,16 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 
         double cpuFrameMs = (CFAbsoluteTimeGetCurrent() - cpuFrameStart) * 1000.0;
         double memoryMB = (double)[self estimatedVideoMemoryBytes] / (1024.0 * 1024.0);
-        @synchronized (self)
-        {
-            _lastCPUFrameTimeMs = cpuFrameMs;
-            _lastEstimatedMemoryMB = memoryMB;
-            _lastTimeScale = timeScale;
-            _lastEdgeStrength = edgeStrength;
-            _lastExposure = exposureBias;
-            _lastBloomStrength = bloomStrength;
-            _lastParticleStrength = particleStrength;
-            _lastTemporalBlend = temporalBlend;
-        }
+        os_unfair_lock_lock(&_metricsLock);
+        _lastCPUFrameTimeMs    = cpuFrameMs;
+        _lastEstimatedMemoryMB = memoryMB;
+        _lastTimeScale         = timeScale;
+        _lastEdgeStrength      = edgeStrength;
+        _lastExposure          = exposureBias;
+        _lastBloomStrength     = bloomStrength;
+        _lastParticleStrength  = particleStrength;
+        _lastTemporalBlend     = temporalBlend;
+        os_unfair_lock_unlock(&_metricsLock);
 
         [commandBuffer presentDrawable:drawable];
         [commandBuffer commit];

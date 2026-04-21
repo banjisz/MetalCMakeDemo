@@ -8,7 +8,7 @@
     <key>CFBundleExecutable</key>
     <string>MetalCMakeDemo</string>
     <key>CFBundleIdentifier</key>
-    <string>com.example.metalcmakedemo</string>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
@@ -16,7 +16,7 @@
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
     <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
+    <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>
