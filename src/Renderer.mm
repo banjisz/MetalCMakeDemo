@@ -176,7 +176,6 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     id<MTLTexture> _sceneResolveTexture;
     id<MTLTexture> _sceneDepthTexture;
     id<MTLTexture> _edgeTexture;
-    id<MTLTexture> _postMSAATexture;
     id<MTLTexture> _bloomTextureA;
     id<MTLTexture> _bloomTextureB;
     id<MTLTexture> _particleTexture;
@@ -521,17 +520,6 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     edgeDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     _edgeTexture = [_device newTextureWithDescriptor:edgeDescriptor];
 
-    MTLTextureDescriptor *postMSAADescriptor =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                           width:width
-                                                          height:height
-                                                       mipmapped:NO];
-    postMSAADescriptor.textureType = MTLTextureType2DMultisample;
-    postMSAADescriptor.sampleCount = kSampleCount;
-    postMSAADescriptor.storageMode = MTLStorageModePrivate;
-    postMSAADescriptor.usage = MTLTextureUsageRenderTarget;
-    _postMSAATexture = [_device newTextureWithDescriptor:postMSAADescriptor];
-
     NSUInteger halfWidth  = MAX((NSUInteger)1, width / 2);
     NSUInteger halfHeight = MAX((NSUInteger)1, height / 2);
 
@@ -548,8 +536,8 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 
     MTLTextureDescriptor *particleDescriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
-                                                           width:width
-                                                          height:height
+                                                           width:halfWidth
+                                                          height:halfHeight
                                                        mipmapped:NO];
     particleDescriptor.storageMode = MTLStorageModePrivate;
     particleDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
@@ -580,7 +568,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
                                                           height:height
                                                        mipmapped:NO];
     upscaledDescriptor.storageMode = MTLStorageModePrivate;
-    upscaledDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    upscaledDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
     _upscaledTexture = [_device newTextureWithDescriptor:upscaledDescriptor];
 
     // MetalFX Spatial Scaler (macOS 13+) for topic 14 high-quality upscale.
@@ -607,7 +595,6 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
     total += estimated_texture_bytes(_sceneResolveTexture);
     total += estimated_texture_bytes(_sceneDepthTexture);
     total += estimated_texture_bytes(_edgeTexture);
-    total += estimated_texture_bytes(_postMSAATexture);
     total += estimated_texture_bytes(_bloomTextureA);
     total += estimated_texture_bytes(_bloomTextureB);
     total += estimated_texture_bytes(_particleTexture);
@@ -792,7 +779,6 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         postPipelineDescriptor.vertexFunction = postVertex;
         postPipelineDescriptor.fragmentFunction = postFragment;
         postPipelineDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-        postPipelineDescriptor.rasterSampleCount = kSampleCount;
 
         _postPipelineState = [_device newRenderPipelineStateWithDescriptor:postPipelineDescriptor error:&error];
         if (!_postPipelineState)
@@ -937,30 +923,31 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
                                               options:MTLResourceStorageModePrivate];
         _indexBuffer  = [_device newBufferWithLength:sizeof(cubeIndices)
                                               options:MTLResourceStorageModePrivate];
-                _instanceBuffer = [_device newBufferWithLength:sizeof(InstanceData) * 3
-                                                                                             options:MTLResourceStorageModeShared];
+        _instanceBuffer = [_device newBufferWithLength:sizeof(InstanceData) * 3
+                                               options:MTLResourceStorageModeShared];
         _indexCount = sizeof(cubeIndices) / sizeof(cubeIndices[0]);
-                if (!vertexStaging || !indexStaging || !_vertexBuffer || !_indexBuffer || !_instanceBuffer)
+        if (!vertexStaging || !indexStaging || !_vertexBuffer || !_indexBuffer || !_instanceBuffer)
         {
             NSLog(@"Failed to create mesh buffers.");
             return nil;
         }
 
-                if (_indirectCommandBuffer)
-                {
-                        for (NSUInteger commandIndex = 0; commandIndex < 3; ++commandIndex)
-                        {
-                                id<MTLIndirectRenderCommand> prebuiltICBCommand = [_indirectCommandBuffer indirectRenderCommandAtIndex:commandIndex];
-                                [prebuiltICBCommand drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                                                                                 indexCount:_indexCount
-                                                                                                    indexType:MTLIndexTypeUInt16
-                                                                                                indexBuffer:_indexBuffer
-                                                                                    indexBufferOffset:0
-                                                                                            instanceCount:1
-                                                                                                     baseVertex:0
-                                                                                                 baseInstance:commandIndex];
-                        }
-                }
+        if (_indirectCommandBuffer)
+        {
+            for (NSUInteger commandIndex = 0; commandIndex < 3; ++commandIndex)
+            {
+                id<MTLIndirectRenderCommand> prebuiltICBCommand =
+                    [_indirectCommandBuffer indirectRenderCommandAtIndex:commandIndex];
+                [prebuiltICBCommand drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                                indexCount:_indexCount
+                                                 indexType:MTLIndexTypeUInt16
+                                               indexBuffer:_indexBuffer
+                                         indexBufferOffset:0
+                                             instanceCount:1
+                                                baseVertex:0
+                                              baseInstance:commandIndex];
+            }
+        }
 
         for (NSUInteger i = 0; i < kMaxFramesInFlight; ++i)
         {
@@ -1047,7 +1034,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         }
 
         [self ensureRenderTargetsForDrawable:drawable];
-        if (!_sceneMSAATexture || !_sceneResolveTexture || !_sceneDepthTexture || !_edgeTexture || !_postMSAATexture)
+        if (!_sceneMSAATexture || !_sceneResolveTexture || !_sceneDepthTexture || !_edgeTexture)
         {
             dispatch_semaphore_signal(_inFlightSemaphore);
             return;
@@ -1242,6 +1229,11 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         timeScale = fmaxf(0.1f, timeScale * _userTimeScaleGain);
         edgeStrength = fmaxf(0.0f, edgeStrength * _userEdgeGain);
         exposureBias = fmaxf(0.1f, exposureBias * _userExposureGain);
+        BOOL useEdgeCompute = edgeStrength > 0.05f;
+        if (!useEdgeCompute)
+        {
+            edgeStrength = 0.0f;
+        }
 
         if (_demoTopic == MetalDemoTopicIndirectCommandBuffer)
         {
@@ -1554,7 +1546,7 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
             [sceneEncoder endEncoding];
         }
 
-        if (useDeferredLike)
+        if (useDeferredLike && useEdgeCompute)
         {
             id<MTLComputeCommandEncoder> deferredEncoder = [commandBuffer computeCommandEncoder];
             [deferredEncoder setComputePipelineState:_edgeComputePipelineState];
@@ -1568,17 +1560,6 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
             [deferredEncoder endEncoding];
         }
 
-        id<MTLComputeCommandEncoder> computeEncoder = [commandBuffer computeCommandEncoder];
-        if (!computeEncoder)
-        {
-            dispatch_semaphore_signal(_inFlightSemaphore);
-            return;
-        }
-
-        [computeEncoder setComputePipelineState:_edgeComputePipelineState];
-        [computeEncoder setTexture:_sceneResolveTexture atIndex:0];
-        [computeEncoder setTexture:_edgeTexture atIndex:1];
-
         MTLSize grid = MTLSizeMake(_edgeTexture.width, _edgeTexture.height, 1);
         NSUInteger tgWidth = _edgeComputePipelineState.threadExecutionWidth;
         NSUInteger tgHeight = _edgeComputePipelineState.maxTotalThreadsPerThreadgroup / tgWidth;
@@ -1588,15 +1569,25 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         }
         MTLSize tgSize = MTLSizeMake(tgWidth, tgHeight, 1);
         // useDeferredLike already ran edge detect in its own encoder; skip here to avoid redundant work.
-        if (!useDeferredLike)
+        if (!useDeferredLike && useEdgeCompute)
         {
+            id<MTLComputeCommandEncoder> computeEncoder = [commandBuffer computeCommandEncoder];
+            if (!computeEncoder)
+            {
+                dispatch_semaphore_signal(_inFlightSemaphore);
+                return;
+            }
+
+            [computeEncoder setComputePipelineState:_edgeComputePipelineState];
+            [computeEncoder setTexture:_sceneResolveTexture atIndex:0];
+            [computeEncoder setTexture:_edgeTexture atIndex:1];
             [computeEncoder dispatchThreads:grid threadsPerThreadgroup:tgSize];
             for (uint32_t i = 0; i < extraStressPasses; ++i)
             {
                 [computeEncoder dispatchThreads:grid threadsPerThreadgroup:tgSize];
             }
+            [computeEncoder endEncoding];
         }
-        [computeEncoder endEncoding];
 
         auto dispatch2D = ^(id<MTLComputeCommandEncoder> encoder,
                             id<MTLComputePipelineState> pipeline,
@@ -1611,40 +1602,37 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
 
         if (useBloom)
         {
-            id<MTLComputeCommandEncoder> brightEncoder = [commandBuffer computeCommandEncoder];
+            id<MTLComputeCommandEncoder> bloomEncoder = [commandBuffer computeCommandEncoder];
             float threshold = (_demoTopic == MetalDemoTopicHDRBloomTAA) ? 1.30f : 0.90f;
-            [brightEncoder setTexture:_sceneResolveTexture atIndex:0];
-            [brightEncoder setTexture:_bloomTextureA atIndex:1];
-            [brightEncoder setBytes:&threshold length:sizeof(float) atIndex:0];
-            dispatch2D(brightEncoder, _brightExtractPipelineState, _bloomTextureA.width, _bloomTextureA.height);
-            [brightEncoder endEncoding];
+            [bloomEncoder setTexture:_sceneResolveTexture atIndex:0];
+            [bloomEncoder setTexture:_bloomTextureA atIndex:1];
+            [bloomEncoder setBytes:&threshold length:sizeof(float) atIndex:0];
+            dispatch2D(bloomEncoder, _brightExtractPipelineState, _bloomTextureA.width, _bloomTextureA.height);
+            [bloomEncoder memoryBarrierWithScope:MTLBarrierScopeTextures];
 
-            id<MTLComputeCommandEncoder> blurHEncoder = [commandBuffer computeCommandEncoder];
             uint32_t horizontal = 1;
-            [blurHEncoder setTexture:_bloomTextureA atIndex:0];
-            [blurHEncoder setTexture:_bloomTextureB atIndex:1];
-            [blurHEncoder setBytes:&horizontal length:sizeof(uint32_t) atIndex:0];
-            dispatch2D(blurHEncoder, _blurPipelineState, _bloomTextureB.width, _bloomTextureB.height);
-            [blurHEncoder endEncoding];
+            [bloomEncoder setTexture:_bloomTextureA atIndex:0];
+            [bloomEncoder setTexture:_bloomTextureB atIndex:1];
+            [bloomEncoder setBytes:&horizontal length:sizeof(uint32_t) atIndex:0];
+            dispatch2D(bloomEncoder, _blurPipelineState, _bloomTextureB.width, _bloomTextureB.height);
+            [bloomEncoder memoryBarrierWithScope:MTLBarrierScopeTextures];
 
-            id<MTLComputeCommandEncoder> blurVEncoder = [commandBuffer computeCommandEncoder];
             horizontal = 0;
-            [blurVEncoder setTexture:_bloomTextureB atIndex:0];
-            [blurVEncoder setTexture:_bloomTextureA atIndex:1];
-            [blurVEncoder setBytes:&horizontal length:sizeof(uint32_t) atIndex:0];
-            dispatch2D(blurVEncoder, _blurPipelineState, _bloomTextureA.width, _bloomTextureA.height);
-            [blurVEncoder endEncoding];
+            [bloomEncoder setTexture:_bloomTextureB atIndex:0];
+            [bloomEncoder setTexture:_bloomTextureA atIndex:1];
+            [bloomEncoder setBytes:&horizontal length:sizeof(uint32_t) atIndex:0];
+            dispatch2D(bloomEncoder, _blurPipelineState, _bloomTextureA.width, _bloomTextureA.height);
 
             if (_errorExampleEnabled && _demoTopic == MetalDemoTopicHDRBloomTAA)
             {
-                id<MTLComputeCommandEncoder> extraBlur = [commandBuffer computeCommandEncoder];
+                [bloomEncoder memoryBarrierWithScope:MTLBarrierScopeTextures];
                 horizontal = 1;
-                [extraBlur setTexture:_bloomTextureA atIndex:0];
-                [extraBlur setTexture:_bloomTextureB atIndex:1];
-                [extraBlur setBytes:&horizontal length:sizeof(uint32_t) atIndex:0];
-                dispatch2D(extraBlur, _blurPipelineState, _bloomTextureB.width, _bloomTextureB.height);
-                [extraBlur endEncoding];
+                [bloomEncoder setTexture:_bloomTextureA atIndex:0];
+                [bloomEncoder setTexture:_bloomTextureB atIndex:1];
+                [bloomEncoder setBytes:&horizontal length:sizeof(uint32_t) atIndex:0];
+                dispatch2D(bloomEncoder, _blurPipelineState, _bloomTextureB.width, _bloomTextureB.height);
             }
+            [bloomEncoder endEncoding];
         }
 
         if (useParticles)
@@ -1698,10 +1686,9 @@ static uint64_t estimated_texture_bytes(id<MTLTexture> texture)
         }
 
         MTLRenderPassDescriptor *postPass = [MTLRenderPassDescriptor renderPassDescriptor];
-        postPass.colorAttachments[0].texture = _postMSAATexture;
-        postPass.colorAttachments[0].resolveTexture = drawable.texture;
+        postPass.colorAttachments[0].texture = drawable.texture;
         postPass.colorAttachments[0].loadAction = MTLLoadActionClear;
-        postPass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+        postPass.colorAttachments[0].storeAction = MTLStoreActionStore;
         postPass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 
         id<MTLRenderCommandEncoder> postEncoder =

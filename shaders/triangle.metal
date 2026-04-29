@@ -238,7 +238,8 @@ fragment float4 post_fragment(PostVertexOut in [[stage_in]],
                               constant PostProcessParams &params [[buffer(0)]])
 {
     float3 sceneColor = sceneTexture.sample(postSampler, in.uv).rgb;
-    float edge = edgeTexture.sample(postSampler, in.uv).r * params.edgeStrength;
+    float edge = params.edgeStrength > 0.0001 ? edgeTexture.sample(postSampler, in.uv).r * params.edgeStrength
+                                               : 0.0;
     float3 bloom = params.bloomStrength > 0.0001 ? bloomTexture.sample(postSampler, in.uv).rgb * params.bloomStrength
                                                   : float3(0.0);
     float3 particles = params.particleStrength > 0.0001 ? particleTexture.sample(postSampler, in.uv).rgb * params.particleStrength
