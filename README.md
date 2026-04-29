@@ -83,6 +83,41 @@ Renderer.render()
 
 说明: 已优化切换速度，单数字主题不再等待计时器。
 
+## 渲染后端切换与跨平台
+
+本项目现在支持两套渲染后端：
+
+- Metal：保留原有 1-15 教学主题与高级路径。
+- OpenGL：提供跨平台兼容路径（macOS 可在同一 UI 中切换）。
+
+macOS 运行时切换方式：
+
+- 菜单：`Renderer -> Metal 渲染 (M) / OpenGL 渲染 (O)`
+- 键盘：`M` 切到 Metal，`O` 切到 OpenGL
+- 面板：HUD 顶部分段按钮可直接切换
+
+说明：
+
+- OpenGL 模式已支持与 Metal 对应的 1-15 主题实现（以 OpenGL 方式近似表达相同知识点）。
+- OpenGL 主题也支持参数面板与错误示例开关，便于跨后端对照学习。
+- 切回 Metal 后会继续沿用你当前预选的主题与参数。
+
+### 非 macOS 构建说明
+
+在 `APPLE=OFF` 场景下，CMake 会构建 `src/OpenGLCrossPlatformMain.cpp`（GLFW + OpenGL）。
+
+依赖：
+
+- OpenGL
+- glfw3
+
+示例：
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
 ## 15 个主题总览
 
 1. Resource And Memory Modes

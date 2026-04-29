@@ -1,5 +1,6 @@
 #import "AppDelegate.h"
 #import "Renderer.h"
+#import "OpenGLRenderer.h"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CADisplayLink.h>   // macOS 14+: replaces CVDisplayLink
 // CADisplayLink fires directly on the main run loop — no dispatch_async needed.
@@ -58,6 +59,12 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     return label;
 }
 
+typedef NS_ENUM(NSInteger, DemoRenderBackend)
+{
+    DemoRenderBackendMetal = 0,
+    DemoRenderBackendOpenGL = 1
+};
+
 @interface MetalView : NSView
 @property (nonatomic, weak) id keyEventTarget;
 @end
@@ -95,11 +102,42 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
 
 @end
 
+@interface OpenGLView : NSOpenGLView
+@property (nonatomic, weak) id keyEventTarget;
+@end
+
+@implementation OpenGLView
+
+- (BOOL)acceptsFirstResponder
+{
+    return YES;
+}
+
+- (void)keyDown:(NSEvent *)event
+{
+    if (_keyEventTarget && [_keyEventTarget respondsToSelector:@selector(handleDemoKeyEvent:)])
+    {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [_keyEventTarget performSelector:@selector(handleDemoKeyEvent:) withObject:event];
+#pragma clang diagnostic pop
+        return;
+    }
+
+    [super keyDown:event];
+}
+
+@end
+
 @interface AppDelegate ()
 {
     NSWindow *_window;
+    NSView *_contentRootView;
     MetalView *_metalView;
+    OpenGLView *_openGLView;
     Renderer *_renderer;
+    OpenGLRenderer *_openGLRenderer;
+    DemoRenderBackend _activeBackend;
     CADisplayLink *_displayLink;     // macOS 14+ replacement for CVDisplayLink
     NSMutableString *_topicInputBuffer;
     NSTimer *_topicInputTimer;
@@ -114,6 +152,7 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     NSTextField *_timeScaleValueLabel;
     NSTextField *_edgeGainValueLabel;
     NSTextField *_exposureGainValueLabel;
+    NSSegmentedControl *_backendSegmentedControl;
     NSButton *_errorToggleButton;
 
     NSWindow *_docWindow;
@@ -121,6 +160,8 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
 
     NSMenuItem *_errorMenuItem;
     NSMenuItem *_docMenuItem;
+    NSMenuItem *_metalBackendMenuItem;
+    NSMenuItem *_openGLBackendMenuItem;
 
     // Perf: cache last drawable size to skip redundant CALayer property writes.
     CGSize _lastDrawableSize;
@@ -146,12 +187,19 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
 - (void)handleParameterSliderChanged:(id)sender;
 - (void)toggleErrorExample:(id)sender;
 - (void)toggleDocumentationWindow:(id)sender;
+- (void)selectRenderBackendFromPanel:(id)sender;
+- (void)selectMetalBackend:(id)sender;
+- (void)selectOpenGLBackend:(id)sender;
+- (void)switchRenderBackend:(DemoRenderBackend)backend;
+- (void)applyBackendControlState;
+- (NSView *)activeRenderView;
 @end
 
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
 {
+    (void)notification;
     NSRect frame = NSMakeRect(100, 100, 800, 600);
 
     _window = [[NSWindow alloc] initWithContentRect:frame
@@ -162,12 +210,55 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
                                               defer:NO];
     [_window setTitle:@"Metal CMake Advanced Demo"];
     [_window setRestorable:NO];
-    [_window makeKeyAndOrderFront:nil];
 
-    _metalView = [[MetalView alloc] initWithFrame:frame];
+    _contentRootView = [[NSView alloc] initWithFrame:frame];
+    _contentRootView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [_window setContentView:_contentRootView];
+
+    _metalView = [[MetalView alloc] initWithFrame:_contentRootView.bounds];
+    _metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     _metalView.keyEventTarget = self;
     [_metalView setWantsLayer:YES];
-    [_window setContentView:_metalView];
+    [_contentRootView addSubview:_metalView];
+
+    NSOpenGLPixelFormatAttribute attrs[] = {
+        NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion3_2Core,
+        NSOpenGLPFAColorSize, 24,
+        NSOpenGLPFAAlphaSize, 8,
+        NSOpenGLPFADepthSize, 24,
+        NSOpenGLPFADoubleBuffer,
+        NSOpenGLPFAAccelerated,
+        0
+    };
+
+    NSOpenGLPixelFormat *pixelFormat = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
+    if (!pixelFormat)
+    {
+        NSLog(@"Failed to create NSOpenGLPixelFormat. OpenGL backend disabled.");
+    }
+    else
+    {
+        _openGLView = [[OpenGLView alloc] initWithFrame:_contentRootView.bounds pixelFormat:pixelFormat];
+        _openGLView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        _openGLView.keyEventTarget = self;
+        _openGLView.wantsBestResolutionOpenGLSurface = YES;
+        _openGLView.hidden = YES;
+        [_contentRootView addSubview:_openGLView];
+
+        GLint swapInterval = 1;
+        [_openGLView.openGLContext setValues:&swapInterval forParameter:NSOpenGLContextParameterSwapInterval];
+
+        _openGLRenderer = [[OpenGLRenderer alloc] initWithOpenGLView:_openGLView];
+        if (![_openGLRenderer isReady])
+        {
+            NSLog(@"OpenGL renderer initialization failed. OpenGL backend disabled.");
+            _openGLRenderer = nil;
+            [_openGLView removeFromSuperview];
+            _openGLView = nil;
+        }
+    }
+
+    [_window makeKeyAndOrderFront:nil];
     [_window makeFirstResponder:_metalView];
 
     if (![_metalView.layer isKindOfClass:[CAMetalLayer class]])
@@ -191,18 +282,20 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
         return;
     }
 
+    _activeBackend = DemoRenderBackendMetal;
     _topicInputBuffer = [NSMutableString string];
     [self switchToTopic:MetalDemoTopicResourceMemory];
     [self installDemoMenu];
     [self installRuntimePanel];
     [self installDocumentationWindow];
     [self applyUserParametersFromPanel];
+    [self switchRenderBackend:DemoRenderBackendMetal];
     [self refreshRuntimePanel];
     [self updateDocumentationPage];
 
     if (![self startDisplayLink])
     {
-        NSLog(@"Failed to start CVDisplayLink.");
+        NSLog(@"Failed to start CADisplayLink.");
         [NSApp terminate:nil];
         return;
     }
@@ -252,13 +345,45 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     _docMenuItem.target = self;
     _docMenuItem.state = NSControlStateValueOn;
     [demoMenu addItem:_docMenuItem];
+
+    NSMenuItem *rendererMenuItem = [[NSMenuItem alloc] initWithTitle:@"Renderer" action:nil keyEquivalent:@""];
+    NSMenu *rendererMenu = [[NSMenu alloc] initWithTitle:@"Renderer"];
+    rendererMenuItem.submenu = rendererMenu;
+    [mainMenu addItem:rendererMenuItem];
+
+    _metalBackendMenuItem = [[NSMenuItem alloc] initWithTitle:@"Metal 渲染 (M)"
+                                                       action:@selector(selectMetalBackend:)
+                                                keyEquivalent:@"m"];
+    _metalBackendMenuItem.target = self;
+    [rendererMenu addItem:_metalBackendMenuItem];
+
+    _openGLBackendMenuItem = [[NSMenuItem alloc] initWithTitle:@"OpenGL 渲染 (O)"
+                                                        action:@selector(selectOpenGLBackend:)
+                                                 keyEquivalent:@"o"];
+    _openGLBackendMenuItem.target = self;
+    _openGLBackendMenuItem.enabled = (_openGLRenderer != nil);
+    [rendererMenu addItem:_openGLBackendMenuItem];
+
+    [self applyBackendControlState];
 }
 
 - (void)updateWindowTitle
 {
-    NSString *title = [NSString stringWithFormat:@"Metal Learning Demo - %ld. %@",
-                       (long)_renderer.demoTopic,
-                       [_renderer demoTopicTitle]];
+    NSString *title;
+    if (_activeBackend == DemoRenderBackendMetal)
+    {
+        title = [NSString stringWithFormat:@"Metal Learning Demo - %ld. %@",
+                 (long)_renderer.demoTopic,
+                 [_renderer demoTopicTitle]];
+    }
+    else
+    {
+        MetalDemoTopic topic = _openGLRenderer ? [_openGLRenderer demoTopic] : _renderer.demoTopic;
+        NSString *topicTitle = _openGLRenderer ? [_openGLRenderer demoTopicTitle] : _renderer.demoTopicTitle;
+        title = [NSString stringWithFormat:@"OpenGL Cross-Platform Demo - 预选主题 %ld. %@",
+                 (long)topic,
+                 topicTitle];
+    }
     [_window setTitle:title];
 }
 
@@ -270,6 +395,10 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     }
 
     [_renderer setDemoTopic:topic];
+    if (_openGLRenderer)
+    {
+        [_openGLRenderer setDemoTopic:topic];
+    }
     [self updateWindowTitle];
     [self updateDocumentationPage];
     [self refreshRuntimePanel];
@@ -294,6 +423,15 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     NSTextField *title = MakeHUDLabel(NSMakeRect(12, 330, 346, 20), 12.0, NSColor.whiteColor, YES);
     title.stringValue = @"实时参数面板";
     [_runtimePanel addSubview:title];
+
+    _backendSegmentedControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(214, 328, 144, 22)];
+    [_backendSegmentedControl setSegmentCount:2];
+    [_backendSegmentedControl setLabel:@"Metal" forSegment:0];
+    [_backendSegmentedControl setLabel:@"OpenGL" forSegment:1];
+    _backendSegmentedControl.selectedSegment = 0;
+    _backendSegmentedControl.target = self;
+    _backendSegmentedControl.action = @selector(selectRenderBackendFromPanel:);
+    [_runtimePanel addSubview:_backendSegmentedControl];
 
     _metricsLabel = MakeHUDLabel(NSMakeRect(12, 262, 346, 60), 11.0, NSColor.whiteColor, NO);
     [_runtimePanel addSubview:_metricsLabel];
@@ -360,7 +498,7 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     _errorHintLabel = MakeHUDLabel(NSMakeRect(12, 12, 346, 42), 10.5, [NSColor colorWithRed:1.0 green:0.84 blue:0.35 alpha:1.0], NO);
     [_runtimePanel addSubview:_errorHintLabel];
 
-    [_metalView addSubview:_runtimePanel];
+    [_contentRootView addSubview:_runtimePanel];
 }
 
 - (void)installDocumentationWindow
@@ -402,48 +540,128 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     [_renderer setUserParameterTimeScale:(float)_timeScaleSlider.doubleValue
                                 edgeGain:(float)_edgeGainSlider.doubleValue
                             exposureGain:(float)_exposureGainSlider.doubleValue];
+    if (_openGLRenderer)
+    {
+        [_openGLRenderer setUserParameterTimeScale:(float)_timeScaleSlider.doubleValue
+                                          edgeGain:(float)_edgeGainSlider.doubleValue
+                                      exposureGain:(float)_exposureGainSlider.doubleValue];
+    }
 }
 
 - (void)refreshRuntimePanel
 {
-    MetalDemoRuntimeStats stats = [_renderer runtimeStats];
-    NSString *gpuText = stats.gpuFrameTimeMs >= 0.0
-                        ? [NSString stringWithFormat:@"%.2f ms", stats.gpuFrameTimeMs]
-                        : @"N/A";
-
-    _metricsLabel.stringValue = [NSString stringWithFormat:@"主题 %ld: %@\nCPU 帧时: %.2f ms   GPU 帧时: %@\n显存占用: %.1f MB",
-                                 (long)_renderer.demoTopic,
-                                 _renderer.demoTopicTitle,
-                                 stats.cpuFrameTimeMs,
-                                 gpuText,
-                                 stats.estimatedMemoryMB];
-
-    _parameterLabel.stringValue = [NSString stringWithFormat:@"实时参数\nScene %@\nPost %@\nUpscale %@\nFallback %@",
-                                   [_renderer scenePathSummary],
-                                   [_renderer postPathSummary],
-                                   [_renderer upscalePathSummary],
-                                   [_renderer runtimeFallbackSummary]];
-
     _timeScaleValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _timeScaleSlider.doubleValue];
     _edgeGainValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _edgeGainSlider.doubleValue];
     _exposureGainValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _exposureGainSlider.doubleValue];
 
-    _errorToggleButton.state = stats.errorExampleEnabled ? NSControlStateValueOn : NSControlStateValueOff;
-    _errorMenuItem.state = _errorToggleButton.state;
-    if (stats.errorExampleEnabled)
+    if (_activeBackend == DemoRenderBackendMetal)
     {
-        _errorHintLabel.stringValue = [NSString stringWithFormat:@"错误示例: %@", [_renderer errorExampleSummary]];
+        MetalDemoRuntimeStats stats = [_renderer runtimeStats];
+        NSString *gpuText = stats.gpuFrameTimeMs >= 0.0
+                            ? [NSString stringWithFormat:@"%.2f ms", stats.gpuFrameTimeMs]
+                            : @"N/A";
+
+        _metricsLabel.stringValue = [NSString stringWithFormat:@"主题 %ld: %@\nCPU 帧时: %.2f ms   GPU 帧时: %@\n显存占用: %.1f MB",
+                                     (long)_renderer.demoTopic,
+                                     _renderer.demoTopicTitle,
+                                     stats.cpuFrameTimeMs,
+                                     gpuText,
+                                     stats.estimatedMemoryMB];
+
+        _parameterLabel.stringValue = [NSString stringWithFormat:@"实时参数\nScene %@\nPost %@\nUpscale %@\nFallback %@",
+                                       [_renderer scenePathSummary],
+                                       [_renderer postPathSummary],
+                                       [_renderer upscalePathSummary],
+                                       [_renderer runtimeFallbackSummary]];
+
+        _errorToggleButton.state = stats.errorExampleEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+        _errorMenuItem.state = _errorToggleButton.state;
+        if (stats.errorExampleEnabled)
+        {
+            _errorHintLabel.stringValue = [NSString stringWithFormat:@"错误示例: %@", [_renderer errorExampleSummary]];
+        }
+        else
+        {
+            _errorHintLabel.stringValue = @"错误示例: 已关闭。可按 E 快速切换。";
+        }
     }
     else
     {
-        _errorHintLabel.stringValue = @"错误示例: 已关闭。可按 E 快速切换。";
+        OpenGLRuntimeStats stats = {0};
+        if (_openGLRenderer)
+        {
+            stats = [_openGLRenderer runtimeStats];
+        }
+
+        MetalDemoTopic topic = _openGLRenderer ? [_openGLRenderer demoTopic] : _renderer.demoTopic;
+        NSString *title = _openGLRenderer ? [_openGLRenderer demoTopicTitle] : _renderer.demoTopicTitle;
+        NSString *scenePath = _openGLRenderer ? [_openGLRenderer scenePathSummary] : @"OpenGL Scene";
+        NSString *postPath = _openGLRenderer ? [_openGLRenderer postPathSummary] : @"Post";
+        NSString *upscalePath = _openGLRenderer ? [_openGLRenderer upscalePathSummary] : @"Off";
+        NSString *fallback = _openGLRenderer ? [_openGLRenderer runtimeFallbackSummary] : @"No";
+
+        _metricsLabel.stringValue = [NSString stringWithFormat:@"主题 %ld: %@\nCPU 帧时: %.2f ms   FPS: %.1f\nTime %.2f  Edge %.2f  Exp %.2f",
+                                     (long)topic,
+                                     title,
+                                     stats.cpuFrameTimeMs,
+                                     stats.fpsEstimate,
+                                     stats.timeScale,
+                                     stats.edgeStrength,
+                                     stats.exposure];
+
+        _parameterLabel.stringValue = [NSString stringWithFormat:@"OpenGL 主题路径\nScene %@\nPost %@\nUpscale %@\nFallback %@",
+                                       scenePath,
+                                       postPath,
+                                       upscalePath,
+                                       fallback];
+
+        _errorToggleButton.state = stats.errorExampleEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+        _errorMenuItem.state = _errorToggleButton.state;
+        if (stats.errorExampleEnabled && _openGLRenderer)
+        {
+            _errorHintLabel.stringValue = [NSString stringWithFormat:@"错误示例: %@", [_openGLRenderer errorExampleSummary]];
+        }
+        else
+        {
+            _errorHintLabel.stringValue = @"错误示例: 已关闭。OpenGL 主题展示标准实现路径。";
+        }
     }
+
+    [self applyBackendControlState];
 }
 
 - (void)updateDocumentationPage
 {
     if (!_docTextView)
     {
+        return;
+    }
+
+    if (_activeBackend == DemoRenderBackendOpenGL)
+    {
+        MetalDemoTopic topic = _openGLRenderer ? [_openGLRenderer demoTopic] : _renderer.demoTopic;
+        NSString *title = _openGLRenderer ? [_openGLRenderer demoTopicTitle] : _renderer.demoTopicTitle;
+        NSString *doc = TopicDocumentation(topic);
+        NSString *scenePath = _openGLRenderer ? [_openGLRenderer scenePathSummary] : @"OpenGL Scene";
+        NSString *postPath = _openGLRenderer ? [_openGLRenderer postPathSummary] : @"Post";
+        NSString *upscalePath = _openGLRenderer ? [_openGLRenderer upscalePathSummary] : @"Off";
+        NSString *fallback = _openGLRenderer ? [_openGLRenderer runtimeFallbackSummary] : @"No";
+        NSString *errorPart = (_openGLRenderer && [_openGLRenderer errorExampleEnabled])
+                              ? [_openGLRenderer errorExampleSummary]
+                              : @"错误示例关闭时显示 OpenGL 对应实现路径。";
+
+        _docTextView.string = [NSString stringWithFormat:@"渲染后端: OpenGL\n主题 %ld: %@\n\n对应渲染路径:\nScene %@\nPost %@\nUpscale %@\nFallback %@\n\n%@\n\n错误示例开关说明:\n%@\n\n快捷键:\nM 切到 Metal\nO 切到 OpenGL\nE 错误示例开关\nH 显示/隐藏说明页",
+                               (long)topic,
+                               title,
+                               scenePath,
+                               postPath,
+                               upscalePath,
+                               fallback,
+                               doc,
+                               errorPart];
+        [_docWindow setTitle:[NSString stringWithFormat:@"场景说明页 - OpenGL - %ld. %@",
+                              (long)topic,
+                              title]];
         return;
     }
 
@@ -477,15 +695,23 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     }
     else
     {
-        enabled = ![_renderer errorExampleEnabled];
+        BOOL currentEnabled = (_activeBackend == DemoRenderBackendMetal)
+                            ? [_renderer errorExampleEnabled]
+                            : (_openGLRenderer ? [_openGLRenderer errorExampleEnabled]
+                                               : [_renderer errorExampleEnabled]);
+        enabled = !currentEnabled;
     }
 
     [_renderer setErrorExampleEnabled:enabled];
+    if (_openGLRenderer)
+    {
+        [_openGLRenderer setErrorExampleEnabled:enabled];
+    }
     _errorToggleButton.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
     _errorMenuItem.state = _errorToggleButton.state;
     [self updateDocumentationPage];
     [self refreshRuntimePanel];
-    [_window makeFirstResponder:_metalView];
+    [_window makeFirstResponder:[self activeRenderView]];
 }
 
 - (void)toggleDocumentationWindow:(id)sender
@@ -506,7 +732,7 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
         [_docWindow orderFront:nil];
         _docMenuItem.state = NSControlStateValueOn;
     }
-    [_window makeFirstResponder:_metalView];
+    [_window makeFirstResponder:[self activeRenderView]];
 }
 
 - (void)commitTopicBuffer
@@ -536,6 +762,18 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     }
 
     unichar c = [characters characterAtIndex:0];
+    if (c == 'm' || c == 'M')
+    {
+        [self switchRenderBackend:DemoRenderBackendMetal];
+        return;
+    }
+
+    if (c == 'o' || c == 'O')
+    {
+        [self switchRenderBackend:DemoRenderBackendOpenGL];
+        return;
+    }
+
     if (c == 'e' || c == 'E')
     {
         [self toggleErrorExample:nil];
@@ -550,7 +788,10 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
 
     if (c == 'c' || c == 'C')
     {
-        [_renderer requestOneFrameCapture];
+        if (_activeBackend == DemoRenderBackendMetal)
+        {
+            [_renderer requestOneFrameCapture];
+        }
         return;
     }
 
@@ -638,6 +879,21 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
 
 - (void)drawFrame
 {
+    if (_activeBackend == DemoRenderBackendOpenGL)
+    {
+        if (_openGLRenderer)
+        {
+            [_openGLRenderer render];
+        }
+
+        if (++_hudRefreshCounter >= 12)
+        {
+            _hudRefreshCounter = 0;
+            [self refreshRuntimePanel];
+        }
+        return;
+    }
+
     if (![_metalView.layer isKindOfClass:[CAMetalLayer class]])
     {
         return;
@@ -666,8 +922,76 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
     }
 }
 
+- (NSView *)activeRenderView
+{
+    if (_activeBackend == DemoRenderBackendOpenGL && _openGLView)
+    {
+        return _openGLView;
+    }
+    return _metalView;
+}
+
+- (void)applyBackendControlState
+{
+    BOOL isMetal = (_activeBackend == DemoRenderBackendMetal);
+
+    _backendSegmentedControl.enabled = (_openGLRenderer != nil);
+    _backendSegmentedControl.selectedSegment = isMetal ? 0 : 1;
+
+    _metalBackendMenuItem.state = isMetal ? NSControlStateValueOn : NSControlStateValueOff;
+    _openGLBackendMenuItem.state = isMetal ? NSControlStateValueOff : NSControlStateValueOn;
+    _openGLBackendMenuItem.enabled = (_openGLRenderer != nil);
+
+    _timeScaleSlider.enabled = YES;
+    _edgeGainSlider.enabled = YES;
+    _exposureGainSlider.enabled = YES;
+    _errorToggleButton.enabled = YES;
+    _errorMenuItem.enabled = YES;
+}
+
+- (void)switchRenderBackend:(DemoRenderBackend)backend
+{
+    if (backend == DemoRenderBackendOpenGL && !_openGLRenderer)
+    {
+        NSBeep();
+        backend = DemoRenderBackendMetal;
+    }
+
+    _activeBackend = backend;
+    BOOL isMetal = (_activeBackend == DemoRenderBackendMetal);
+    _metalView.hidden = !isMetal;
+    _openGLView.hidden = isMetal;
+    _lastDrawableSize = CGSizeZero;
+
+    [self applyBackendControlState];
+    [self updateWindowTitle];
+    [self updateDocumentationPage];
+    [self refreshRuntimePanel];
+    [_window makeFirstResponder:[self activeRenderView]];
+}
+
+- (void)selectRenderBackendFromPanel:(id)sender
+{
+    (void)sender;
+    NSInteger selected = _backendSegmentedControl.selectedSegment;
+    [self switchRenderBackend:(selected == 0) ? DemoRenderBackendMetal : DemoRenderBackendOpenGL];
+}
+
+- (void)selectMetalBackend:(id)sender
+{
+    (void)sender;
+    [self switchRenderBackend:DemoRenderBackendMetal];
+}
+
+- (void)selectOpenGLBackend:(id)sender
+{
+    (void)sender;
+    [self switchRenderBackend:DemoRenderBackendOpenGL];
+}
+
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
 {
+    (void)sender;
     return YES;
 }
 

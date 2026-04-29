@@ -102,7 +102,7 @@ DerivedData/
 ### Xcode Patch ###
 **/xcshareddata/WorkspaceSettings.xcsettings
 
-
+.codex
 
 CMakeFiles
 
