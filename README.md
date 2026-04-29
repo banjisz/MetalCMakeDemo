@@ -85,15 +85,16 @@ Renderer.render()
 
 ## 渲染后端切换与跨平台
 
-本项目现在支持两套渲染后端：
+本项目现在支持三种运行时渲染选项：
 
 - Metal：保留原有 1-15 教学主题与高级路径。
-- OpenGL：提供跨平台兼容路径（macOS 可在同一 UI 中切换）。
+- OpenGL 三角形：轻量路径，保留当前三角形主题实现。
+- OpenGL 立方体：以立方体为主几何，提供与 Metal 一致的 1-15 主题学习入口。
 
 macOS 运行时切换方式：
 
-- 菜单：`Renderer -> Metal 渲染 (M) / OpenGL 渲染 (O)`
-- 键盘：`M` 切到 Metal，`O` 切到 OpenGL
+- 菜单：`Renderer -> Metal 渲染 (M) / OpenGL 三角形渲染 (O) / OpenGL 立方体渲染 (P)`
+- 键盘：`M` 切到 Metal，`O` 切到 OpenGL 三角形，`P` 切到 OpenGL 立方体
 - 面板：HUD 顶部分段按钮可直接切换
 
 说明：

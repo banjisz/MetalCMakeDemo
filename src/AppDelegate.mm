@@ -62,7 +62,8 @@ static NSTextField *MakeHUDLabel(NSRect frame, CGFloat fontSize, NSColor *color,
 typedef NS_ENUM(NSInteger, DemoRenderBackend)
 {
     DemoRenderBackendMetal = 0,
-    DemoRenderBackendOpenGL = 1
+    DemoRenderBackendOpenGLTriangle = 1,
+    DemoRenderBackendOpenGLCube = 2
 };
 
 @interface MetalView : NSView
@@ -149,9 +150,15 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     NSSlider *_timeScaleSlider;
     NSSlider *_edgeGainSlider;
     NSSlider *_exposureGainSlider;
+    NSSlider *_topic9ThresholdASlider;
+    NSSlider *_topic9ThresholdBSlider;
+    NSSlider *_topic9BlurPassSlider;
     NSTextField *_timeScaleValueLabel;
     NSTextField *_edgeGainValueLabel;
     NSTextField *_exposureGainValueLabel;
+    NSTextField *_topic9ThresholdAValueLabel;
+    NSTextField *_topic9ThresholdBValueLabel;
+    NSTextField *_topic9BlurPassValueLabel;
     NSSegmentedControl *_backendSegmentedControl;
     NSButton *_errorToggleButton;
 
@@ -161,7 +168,8 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     NSMenuItem *_errorMenuItem;
     NSMenuItem *_docMenuItem;
     NSMenuItem *_metalBackendMenuItem;
-    NSMenuItem *_openGLBackendMenuItem;
+    NSMenuItem *_openGLTriangleBackendMenuItem;
+    NSMenuItem *_openGLCubeBackendMenuItem;
 
     // Perf: cache last drawable size to skip redundant CALayer property writes.
     CGSize _lastDrawableSize;
@@ -189,7 +197,8 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
 - (void)toggleDocumentationWindow:(id)sender;
 - (void)selectRenderBackendFromPanel:(id)sender;
 - (void)selectMetalBackend:(id)sender;
-- (void)selectOpenGLBackend:(id)sender;
+- (void)selectOpenGLTriangleBackend:(id)sender;
+- (void)selectOpenGLCubeBackend:(id)sender;
 - (void)switchRenderBackend:(DemoRenderBackend)backend;
 - (void)applyBackendControlState;
 - (NSView *)activeRenderView;
@@ -357,12 +366,19 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     _metalBackendMenuItem.target = self;
     [rendererMenu addItem:_metalBackendMenuItem];
 
-    _openGLBackendMenuItem = [[NSMenuItem alloc] initWithTitle:@"OpenGL 渲染 (O)"
-                                                        action:@selector(selectOpenGLBackend:)
-                                                 keyEquivalent:@"o"];
-    _openGLBackendMenuItem.target = self;
-    _openGLBackendMenuItem.enabled = (_openGLRenderer != nil);
-    [rendererMenu addItem:_openGLBackendMenuItem];
+        _openGLTriangleBackendMenuItem = [[NSMenuItem alloc] initWithTitle:@"OpenGL 三角形渲染 (O)"
+                                         action:@selector(selectOpenGLTriangleBackend:)
+                                     keyEquivalent:@"o"];
+        _openGLTriangleBackendMenuItem.target = self;
+        _openGLTriangleBackendMenuItem.enabled = (_openGLRenderer != nil);
+        [rendererMenu addItem:_openGLTriangleBackendMenuItem];
+
+        _openGLCubeBackendMenuItem = [[NSMenuItem alloc] initWithTitle:@"OpenGL 立方体渲染 (P)"
+                                        action:@selector(selectOpenGLCubeBackend:)
+                                    keyEquivalent:@"p"];
+        _openGLCubeBackendMenuItem.target = self;
+        _openGLCubeBackendMenuItem.enabled = (_openGLRenderer != nil);
+        [rendererMenu addItem:_openGLCubeBackendMenuItem];
 
     [self applyBackendControlState];
 }
@@ -380,7 +396,9 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     {
         MetalDemoTopic topic = _openGLRenderer ? [_openGLRenderer demoTopic] : _renderer.demoTopic;
         NSString *topicTitle = _openGLRenderer ? [_openGLRenderer demoTopicTitle] : _renderer.demoTopicTitle;
-        title = [NSString stringWithFormat:@"OpenGL Cross-Platform Demo - 预选主题 %ld. %@",
+        NSString *modeTitle = _openGLRenderer ? [_openGLRenderer renderModeTitle] : @"OpenGL";
+        title = [NSString stringWithFormat:@"%@ - 预选主题 %ld. %@",
+                 modeTitle,
                  (long)topic,
                  topicTitle];
     }
@@ -411,7 +429,7 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
         return;
     }
 
-    NSRect frame = NSMakeRect(14, 14, 370, 360);
+    NSRect frame = NSMakeRect(14, 14, 370, 468);
     _runtimePanel = [[NSVisualEffectView alloc] initWithFrame:frame];
     _runtimePanel.material = NSVisualEffectMaterialHUDWindow;
     _runtimePanel.blendingMode = NSVisualEffectBlendingModeWithinWindow;
@@ -420,34 +438,35 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     _runtimePanel.layer.cornerRadius = 10.0;
     _runtimePanel.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
 
-    NSTextField *title = MakeHUDLabel(NSMakeRect(12, 330, 346, 20), 12.0, NSColor.whiteColor, YES);
+    NSTextField *title = MakeHUDLabel(NSMakeRect(12, 438, 346, 20), 12.0, NSColor.whiteColor, YES);
     title.stringValue = @"实时参数面板";
     [_runtimePanel addSubview:title];
 
-    _backendSegmentedControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(214, 328, 144, 22)];
-    [_backendSegmentedControl setSegmentCount:2];
+    _backendSegmentedControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(140, 436, 218, 22)];
+    [_backendSegmentedControl setSegmentCount:3];
     [_backendSegmentedControl setLabel:@"Metal" forSegment:0];
-    [_backendSegmentedControl setLabel:@"OpenGL" forSegment:1];
+    [_backendSegmentedControl setLabel:@"GL三角" forSegment:1];
+    [_backendSegmentedControl setLabel:@"GL立方" forSegment:2];
     _backendSegmentedControl.selectedSegment = 0;
     _backendSegmentedControl.target = self;
     _backendSegmentedControl.action = @selector(selectRenderBackendFromPanel:);
     [_runtimePanel addSubview:_backendSegmentedControl];
 
-    _metricsLabel = MakeHUDLabel(NSMakeRect(12, 262, 346, 60), 11.0, NSColor.whiteColor, NO);
+    _metricsLabel = MakeHUDLabel(NSMakeRect(12, 366, 346, 62), 11.0, NSColor.whiteColor, NO);
     [_runtimePanel addSubview:_metricsLabel];
 
-    _parameterLabel = MakeHUDLabel(NSMakeRect(12, 198, 346, 60), 11.0, [NSColor colorWithWhite:0.92 alpha:1.0], NO);
+    _parameterLabel = MakeHUDLabel(NSMakeRect(12, 302, 346, 60), 11.0, [NSColor colorWithWhite:0.92 alpha:1.0], NO);
     [_runtimePanel addSubview:_parameterLabel];
 
-    NSTextField *timeLabel = MakeHUDLabel(NSMakeRect(12, 184, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
+    NSTextField *timeLabel = MakeHUDLabel(NSMakeRect(12, 288, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
     timeLabel.stringValue = @"时间倍率";
     [_runtimePanel addSubview:timeLabel];
 
-    _timeScaleValueLabel = MakeHUDLabel(NSMakeRect(300, 184, 58, 16), 11.0, NSColor.whiteColor, NO);
+    _timeScaleValueLabel = MakeHUDLabel(NSMakeRect(300, 288, 58, 16), 11.0, NSColor.whiteColor, NO);
     _timeScaleValueLabel.alignment = NSTextAlignmentRight;
     [_runtimePanel addSubview:_timeScaleValueLabel];
 
-    _timeScaleSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 163, 346, 20)];
+    _timeScaleSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 267, 346, 20)];
     _timeScaleSlider.minValue = 0.5;
     _timeScaleSlider.maxValue = 2.0;
     _timeScaleSlider.doubleValue = 1.0;
@@ -455,15 +474,15 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     _timeScaleSlider.action = @selector(handleParameterSliderChanged:);
     [_runtimePanel addSubview:_timeScaleSlider];
 
-    NSTextField *edgeLabel = MakeHUDLabel(NSMakeRect(12, 143, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
+    NSTextField *edgeLabel = MakeHUDLabel(NSMakeRect(12, 247, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
     edgeLabel.stringValue = @"边缘强度倍率";
     [_runtimePanel addSubview:edgeLabel];
 
-    _edgeGainValueLabel = MakeHUDLabel(NSMakeRect(300, 143, 58, 16), 11.0, NSColor.whiteColor, NO);
+    _edgeGainValueLabel = MakeHUDLabel(NSMakeRect(300, 247, 58, 16), 11.0, NSColor.whiteColor, NO);
     _edgeGainValueLabel.alignment = NSTextAlignmentRight;
     [_runtimePanel addSubview:_edgeGainValueLabel];
 
-    _edgeGainSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 122, 346, 20)];
+    _edgeGainSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 226, 346, 20)];
     _edgeGainSlider.minValue = 0.5;
     _edgeGainSlider.maxValue = 2.5;
     _edgeGainSlider.doubleValue = 1.0;
@@ -471,15 +490,15 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     _edgeGainSlider.action = @selector(handleParameterSliderChanged:);
     [_runtimePanel addSubview:_edgeGainSlider];
 
-    NSTextField *exposureLabel = MakeHUDLabel(NSMakeRect(12, 102, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
+    NSTextField *exposureLabel = MakeHUDLabel(NSMakeRect(12, 206, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
     exposureLabel.stringValue = @"曝光倍率";
     [_runtimePanel addSubview:exposureLabel];
 
-    _exposureGainValueLabel = MakeHUDLabel(NSMakeRect(300, 102, 58, 16), 11.0, NSColor.whiteColor, NO);
+    _exposureGainValueLabel = MakeHUDLabel(NSMakeRect(300, 206, 58, 16), 11.0, NSColor.whiteColor, NO);
     _exposureGainValueLabel.alignment = NSTextAlignmentRight;
     [_runtimePanel addSubview:_exposureGainValueLabel];
 
-    _exposureGainSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 81, 346, 20)];
+    _exposureGainSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 185, 346, 20)];
     _exposureGainSlider.minValue = 0.5;
     _exposureGainSlider.maxValue = 2.5;
     _exposureGainSlider.doubleValue = 1.0;
@@ -487,7 +506,55 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     _exposureGainSlider.action = @selector(handleParameterSliderChanged:);
     [_runtimePanel addSubview:_exposureGainSlider];
 
-    _errorToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(12, 56, 220, 20)];
+    NSTextField *thresholdALabel = MakeHUDLabel(NSMakeRect(12, 165, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
+    thresholdALabel.stringValue = @"Topic9 Bloom 阈值A";
+    [_runtimePanel addSubview:thresholdALabel];
+
+    _topic9ThresholdAValueLabel = MakeHUDLabel(NSMakeRect(300, 165, 58, 16), 11.0, NSColor.whiteColor, NO);
+    _topic9ThresholdAValueLabel.alignment = NSTextAlignmentRight;
+    [_runtimePanel addSubview:_topic9ThresholdAValueLabel];
+
+    _topic9ThresholdASlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 144, 346, 20)];
+    _topic9ThresholdASlider.minValue = 0.20;
+    _topic9ThresholdASlider.maxValue = 1.60;
+    _topic9ThresholdASlider.doubleValue = 0.56;
+    _topic9ThresholdASlider.target = self;
+    _topic9ThresholdASlider.action = @selector(handleParameterSliderChanged:);
+    [_runtimePanel addSubview:_topic9ThresholdASlider];
+
+    NSTextField *thresholdBLabel = MakeHUDLabel(NSMakeRect(12, 124, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
+    thresholdBLabel.stringValue = @"Topic9 Bloom 阈值B";
+    [_runtimePanel addSubview:thresholdBLabel];
+
+    _topic9ThresholdBValueLabel = MakeHUDLabel(NSMakeRect(300, 124, 58, 16), 11.0, NSColor.whiteColor, NO);
+    _topic9ThresholdBValueLabel.alignment = NSTextAlignmentRight;
+    [_runtimePanel addSubview:_topic9ThresholdBValueLabel];
+
+    _topic9ThresholdBSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 103, 346, 20)];
+    _topic9ThresholdBSlider.minValue = 0.30;
+    _topic9ThresholdBSlider.maxValue = 2.20;
+    _topic9ThresholdBSlider.doubleValue = 0.88;
+    _topic9ThresholdBSlider.target = self;
+    _topic9ThresholdBSlider.action = @selector(handleParameterSliderChanged:);
+    [_runtimePanel addSubview:_topic9ThresholdBSlider];
+
+    NSTextField *blurPassLabel = MakeHUDLabel(NSMakeRect(12, 83, 170, 16), 11.0, [NSColor colorWithWhite:0.9 alpha:1.0], NO);
+    blurPassLabel.stringValue = @"Topic9 Blur Pass";
+    [_runtimePanel addSubview:blurPassLabel];
+
+    _topic9BlurPassValueLabel = MakeHUDLabel(NSMakeRect(300, 83, 58, 16), 11.0, NSColor.whiteColor, NO);
+    _topic9BlurPassValueLabel.alignment = NSTextAlignmentRight;
+    [_runtimePanel addSubview:_topic9BlurPassValueLabel];
+
+    _topic9BlurPassSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 62, 346, 20)];
+    _topic9BlurPassSlider.minValue = 2.0;
+    _topic9BlurPassSlider.maxValue = 16.0;
+    _topic9BlurPassSlider.doubleValue = 6.0;
+    _topic9BlurPassSlider.target = self;
+    _topic9BlurPassSlider.action = @selector(handleParameterSliderChanged:);
+    [_runtimePanel addSubview:_topic9BlurPassSlider];
+
+    _errorToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(12, 36, 220, 20)];
     _errorToggleButton.buttonType = NSButtonTypeSwitch;
     _errorToggleButton.title = @"错误示例开关 (E)";
     _errorToggleButton.state = NSControlStateValueOff;
@@ -495,7 +562,7 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     _errorToggleButton.action = @selector(toggleErrorExample:);
     [_runtimePanel addSubview:_errorToggleButton];
 
-    _errorHintLabel = MakeHUDLabel(NSMakeRect(12, 12, 346, 42), 10.5, [NSColor colorWithRed:1.0 green:0.84 blue:0.35 alpha:1.0], NO);
+    _errorHintLabel = MakeHUDLabel(NSMakeRect(12, 8, 346, 24), 10.5, [NSColor colorWithRed:1.0 green:0.84 blue:0.35 alpha:1.0], NO);
     [_runtimePanel addSubview:_errorHintLabel];
 
     [_contentRootView addSubview:_runtimePanel];
@@ -545,6 +612,9 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
         [_openGLRenderer setUserParameterTimeScale:(float)_timeScaleSlider.doubleValue
                                           edgeGain:(float)_edgeGainSlider.doubleValue
                                       exposureGain:(float)_exposureGainSlider.doubleValue];
+        [_openGLRenderer setTopic9BloomThresholdA:(float)_topic9ThresholdASlider.doubleValue
+                                       thresholdB:(float)_topic9ThresholdBSlider.doubleValue
+                                    blurPassCount:(NSInteger)(_topic9BlurPassSlider.doubleValue + 0.5)];
     }
 }
 
@@ -553,6 +623,9 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     _timeScaleValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _timeScaleSlider.doubleValue];
     _edgeGainValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _edgeGainSlider.doubleValue];
     _exposureGainValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _exposureGainSlider.doubleValue];
+    _topic9ThresholdAValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _topic9ThresholdASlider.doubleValue];
+    _topic9ThresholdBValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", _topic9ThresholdBSlider.doubleValue];
+    _topic9BlurPassValueLabel.stringValue = [NSString stringWithFormat:@"%ld", (long)(_topic9BlurPassSlider.doubleValue + 0.5)];
 
     if (_activeBackend == DemoRenderBackendMetal)
     {
@@ -594,26 +667,67 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
         }
 
         MetalDemoTopic topic = _openGLRenderer ? [_openGLRenderer demoTopic] : _renderer.demoTopic;
+        if (topic == MetalDemoTopicHDRBloomTAA && _openGLRenderer)
+        {
+            _topic9ThresholdASlider.doubleValue = stats.topic9ThresholdA;
+            _topic9ThresholdBSlider.doubleValue = stats.topic9ThresholdB;
+            _topic9BlurPassSlider.doubleValue = (double)stats.topic9BlurPassCount;
+            _topic9ThresholdAValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", stats.topic9ThresholdA];
+            _topic9ThresholdBValueLabel.stringValue = [NSString stringWithFormat:@"%.2f", stats.topic9ThresholdB];
+            _topic9BlurPassValueLabel.stringValue = [NSString stringWithFormat:@"%ld", (long)stats.topic9BlurPassCount];
+        }
+
         NSString *title = _openGLRenderer ? [_openGLRenderer demoTopicTitle] : _renderer.demoTopicTitle;
+        NSString *modeTitle = _openGLRenderer ? [_openGLRenderer renderModeTitle] : @"OpenGL";
         NSString *scenePath = _openGLRenderer ? [_openGLRenderer scenePathSummary] : @"OpenGL Scene";
         NSString *postPath = _openGLRenderer ? [_openGLRenderer postPathSummary] : @"Post";
         NSString *upscalePath = _openGLRenderer ? [_openGLRenderer upscalePathSummary] : @"Off";
         NSString *fallback = _openGLRenderer ? [_openGLRenderer runtimeFallbackSummary] : @"No";
+        NSString *topicTuningText = @"";
+        if (topic == MetalDemoTopicHDRBloomTAA)
+        {
+            topicTuningText = [NSString stringWithFormat:@"\nT9 Tune A %.2f B %.2f Blur %ld",
+                               stats.topic9ThresholdA,
+                               stats.topic9ThresholdB,
+                               (long)stats.topic9BlurPassCount];
+        }
+        NSString *topicDetail = @"";
+        if (topic == MetalDemoTopicShadowing)
+        {
+            topicDetail = [NSString stringWithFormat:@"\nT7 Bias %.4f  PCF %.1f", stats.shadowBias, stats.shadowPCFRadius];
+        }
+        else if (topic == MetalDemoTopicHDRBloomTAA)
+        {
+            topicDetail = [NSString stringWithFormat:@"\nT9 A %.2f  B %.2f  Blur %ld",
+                           stats.topic9ThresholdA,
+                           stats.topic9ThresholdB,
+                           (long)stats.topic9BlurPassCount];
+        }
+        else if (topic == MetalDemoTopicProfiling)
+        {
+            topicDetail = [NSString stringWithFormat:@"\nT15 Zone %.2f / %.2f / %.2f",
+                           stats.heatThreshold1,
+                           stats.heatThreshold2,
+                           stats.heatThreshold3];
+        }
 
-        _metricsLabel.stringValue = [NSString stringWithFormat:@"主题 %ld: %@\nCPU 帧时: %.2f ms   FPS: %.1f\nTime %.2f  Edge %.2f  Exp %.2f",
+        _metricsLabel.stringValue = [NSString stringWithFormat:@"主题 %ld: %@\n模式: %@  CPU: %.2f ms  FPS: %.1f\nTime %.2f  Edge %.2f  Exp %.2f%@",
                                      (long)topic,
                                      title,
+                         modeTitle,
                                      stats.cpuFrameTimeMs,
                                      stats.fpsEstimate,
                                      stats.timeScale,
                                      stats.edgeStrength,
-                                     stats.exposure];
+                                     stats.exposure,
+                                     topicDetail];
 
-        _parameterLabel.stringValue = [NSString stringWithFormat:@"OpenGL 主题路径\nScene %@\nPost %@\nUpscale %@\nFallback %@",
+        _parameterLabel.stringValue = [NSString stringWithFormat:@"OpenGL 主题路径\nScene %@\nPost %@\nUpscale %@\nFallback %@%@",
                                        scenePath,
                                        postPath,
                                        upscalePath,
-                                       fallback];
+                           fallback,
+                           topicTuningText];
 
         _errorToggleButton.state = stats.errorExampleEnabled ? NSControlStateValueOn : NSControlStateValueOff;
         _errorMenuItem.state = _errorToggleButton.state;
@@ -637,10 +751,11 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
         return;
     }
 
-    if (_activeBackend == DemoRenderBackendOpenGL)
+    if (_activeBackend != DemoRenderBackendMetal)
     {
         MetalDemoTopic topic = _openGLRenderer ? [_openGLRenderer demoTopic] : _renderer.demoTopic;
         NSString *title = _openGLRenderer ? [_openGLRenderer demoTopicTitle] : _renderer.demoTopicTitle;
+        NSString *modeTitle = _openGLRenderer ? [_openGLRenderer renderModeTitle] : @"OpenGL";
         NSString *doc = TopicDocumentation(topic);
         NSString *scenePath = _openGLRenderer ? [_openGLRenderer scenePathSummary] : @"OpenGL Scene";
         NSString *postPath = _openGLRenderer ? [_openGLRenderer postPathSummary] : @"Post";
@@ -650,7 +765,8 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
                               ? [_openGLRenderer errorExampleSummary]
                               : @"错误示例关闭时显示 OpenGL 对应实现路径。";
 
-        _docTextView.string = [NSString stringWithFormat:@"渲染后端: OpenGL\n主题 %ld: %@\n\n对应渲染路径:\nScene %@\nPost %@\nUpscale %@\nFallback %@\n\n%@\n\n错误示例开关说明:\n%@\n\n快捷键:\nM 切到 Metal\nO 切到 OpenGL\nE 错误示例开关\nH 显示/隐藏说明页",
+        _docTextView.string = [NSString stringWithFormat:@"渲染后端: OpenGL\n模式: %@\n主题 %ld: %@\n\n对应渲染路径:\nScene %@\nPost %@\nUpscale %@\nFallback %@\n\n%@\n\n错误示例开关说明:\n%@\n\n快捷键:\nM 切到 Metal\nO 切到 OpenGL 三角形\nP 切到 OpenGL 立方体\nE 错误示例开关\nH 显示/隐藏说明页",
+                       modeTitle,
                                (long)topic,
                                title,
                                scenePath,
@@ -770,7 +886,13 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
 
     if (c == 'o' || c == 'O')
     {
-        [self switchRenderBackend:DemoRenderBackendOpenGL];
+        [self switchRenderBackend:DemoRenderBackendOpenGLTriangle];
+        return;
+    }
+
+    if (c == 'p' || c == 'P')
+    {
+        [self switchRenderBackend:DemoRenderBackendOpenGLCube];
         return;
     }
 
@@ -879,7 +1001,7 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
 
 - (void)drawFrame
 {
-    if (_activeBackend == DemoRenderBackendOpenGL)
+    if (_activeBackend != DemoRenderBackendMetal)
     {
         if (_openGLRenderer)
         {
@@ -924,7 +1046,7 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
 
 - (NSView *)activeRenderView
 {
-    if (_activeBackend == DemoRenderBackendOpenGL && _openGLView)
+    if (_activeBackend != DemoRenderBackendMetal && _openGLView)
     {
         return _openGLView;
     }
@@ -936,25 +1058,55 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     BOOL isMetal = (_activeBackend == DemoRenderBackendMetal);
 
     _backendSegmentedControl.enabled = (_openGLRenderer != nil);
-    _backendSegmentedControl.selectedSegment = isMetal ? 0 : 1;
+    if (isMetal)
+    {
+        _backendSegmentedControl.selectedSegment = 0;
+    }
+    else if (_activeBackend == DemoRenderBackendOpenGLCube)
+    {
+        _backendSegmentedControl.selectedSegment = 2;
+    }
+    else
+    {
+        _backendSegmentedControl.selectedSegment = 1;
+    }
 
     _metalBackendMenuItem.state = isMetal ? NSControlStateValueOn : NSControlStateValueOff;
-    _openGLBackendMenuItem.state = isMetal ? NSControlStateValueOff : NSControlStateValueOn;
-    _openGLBackendMenuItem.enabled = (_openGLRenderer != nil);
+    _openGLTriangleBackendMenuItem.state = (_activeBackend == DemoRenderBackendOpenGLTriangle) ? NSControlStateValueOn : NSControlStateValueOff;
+    _openGLCubeBackendMenuItem.state = (_activeBackend == DemoRenderBackendOpenGLCube) ? NSControlStateValueOn : NSControlStateValueOff;
+    _openGLTriangleBackendMenuItem.enabled = (_openGLRenderer != nil);
+    _openGLCubeBackendMenuItem.enabled = (_openGLRenderer != nil);
 
     _timeScaleSlider.enabled = YES;
     _edgeGainSlider.enabled = YES;
     _exposureGainSlider.enabled = YES;
+
+    BOOL topic9TuningEnabled = (_activeBackend != DemoRenderBackendMetal) &&
+                               (_openGLRenderer != nil) &&
+                               ([_openGLRenderer renderMode] == OpenGLRenderModeCube) &&
+                               ([_openGLRenderer demoTopic] == MetalDemoTopicHDRBloomTAA);
+    _topic9ThresholdASlider.enabled = topic9TuningEnabled;
+    _topic9ThresholdBSlider.enabled = topic9TuningEnabled;
+    _topic9BlurPassSlider.enabled = topic9TuningEnabled;
+
     _errorToggleButton.enabled = YES;
     _errorMenuItem.enabled = YES;
 }
 
 - (void)switchRenderBackend:(DemoRenderBackend)backend
 {
-    if (backend == DemoRenderBackendOpenGL && !_openGLRenderer)
+    if (backend != DemoRenderBackendMetal && !_openGLRenderer)
     {
         NSBeep();
         backend = DemoRenderBackendMetal;
+    }
+
+    if (_openGLRenderer)
+    {
+        OpenGLRenderMode mode = (backend == DemoRenderBackendOpenGLCube)
+                              ? OpenGLRenderModeCube
+                              : OpenGLRenderModeTriangle;
+        [_openGLRenderer setRenderMode:mode];
     }
 
     _activeBackend = backend;
@@ -974,7 +1126,18 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
 {
     (void)sender;
     NSInteger selected = _backendSegmentedControl.selectedSegment;
-    [self switchRenderBackend:(selected == 0) ? DemoRenderBackendMetal : DemoRenderBackendOpenGL];
+    if (selected == 0)
+    {
+        [self switchRenderBackend:DemoRenderBackendMetal];
+    }
+    else if (selected == 2)
+    {
+        [self switchRenderBackend:DemoRenderBackendOpenGLCube];
+    }
+    else
+    {
+        [self switchRenderBackend:DemoRenderBackendOpenGLTriangle];
+    }
 }
 
 - (void)selectMetalBackend:(id)sender
@@ -983,10 +1146,16 @@ typedef NS_ENUM(NSInteger, DemoRenderBackend)
     [self switchRenderBackend:DemoRenderBackendMetal];
 }
 
-- (void)selectOpenGLBackend:(id)sender
+- (void)selectOpenGLTriangleBackend:(id)sender
 {
     (void)sender;
-    [self switchRenderBackend:DemoRenderBackendOpenGL];
+    [self switchRenderBackend:DemoRenderBackendOpenGLTriangle];
+}
+
+- (void)selectOpenGLCubeBackend:(id)sender
+{
+    (void)sender;
+    [self switchRenderBackend:DemoRenderBackendOpenGLCube];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
